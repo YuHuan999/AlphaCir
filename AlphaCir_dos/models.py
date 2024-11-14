@@ -141,61 +141,130 @@ class MultiQueryAttentionLayer(torch.nn.Module):
 
 class RepresentNet_Trans(torch.nn.Module):
     def __init__(self, 
+                 batch_size,
+                 num_qubits,
                  action_space_size, 
                  max_length_circuit, 
+                 input_dim,
                  embedding_dim, 
                  num_encoderLayer,
+                 nhead = 4, 
                  name: str = 'representation'
                  ):
         super(RepresentNet_Trans, self).__init__()
+        self.batch_size = batch_size
+        self.num_qubits = num_qubits
         self.num_gates = len(action_space_size)
+        self.num_gateTypes = int(self.num_gates / self.num_qubits)
         self.num_positions = max_length_circuit
+        self.input_dim = input_dim # input_dim = gate_onehot.shape[-1] + control_onehot.shape[-1] + target_onehot.shape[-1]
         self.embedding_dim = embedding_dim
+        self.nhead = nhead  # featsize // nhead == 0
+        self.num_encoderLayer = num_encoderLayer
 
-        self.observation_embedding = torch.nn.Embedding(num_embeddings=self.num_gates, embedding_dim=self.embedding_dim)
+
+        self.mlp_embedder = torch.nn.Sequential(
+            nn.Linear(self.input_dim, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim))
+        
+        # self.observation_embedding = torch.nn.Embedding(num_embeddings=self.num_gates, embedding_dim=self.embedding_dim)
         self.position_embedding = torch.nn.Embedding(num_embeddings=self.num_positions, embedding_dim=self.embedding_dim)
         self.attenion_block = torch.nn.MultiheadAttention(embed_dim=self.embedding_dim, num_heads=8, dropout=0.1)
         # self.attenion_block = MultiQueryAttentionLayer(hid_dim=self.embedding_dim, n_heads=8, dropout=0.1, device='gpu')    
-        self.TransformerEncoderLayer = torch.nn.TransformerEncoderLayer(d_model=self.embedding_dim, nhead=8)
-        self.TransformerEncoder = torch.nn.TransformerEncoder(encoder_layer=self.TransformerEncoderLayer, num_layers=num_encoderLayer)
-    
+        self.TransformerEncoderLayer = torch.nn.TransformerEncoderLayer(d_model=self.embedding_dim, nhead= self.nhead )
+        self.TransformerEncoder = torch.nn.TransformerEncoder(encoder_layer=self.TransformerEncoderLayer, num_layers=self.num_encoderLayer)
+        ## if necessary
+        # self.output_layer = torch.nn.Linear(self.embedding_dim, self.output_size)
     def forward(self, obervation):
-
-        obervation_embedded = self.observation_embedding(obervation)
-        position_indices = torch.arange(len(obervation)).unsqueeze(1)
-        position_embedded = self.position_embedding(position_indices)
-        obervation_position_embedded = obervation_embedded + position_embedded
-        attention_input = obervation_position_embedded.permute(1, 0, 2)
-        output = self.TransformerEncoder(attention_input)
+        ## 
+        # for stack is ok; for single sample?
+    
+        # one-hot encoding for circuit_stack
+        obervation_onehot = self.Cir2onehot(obervation, self.batch_size, self.num_positions)
+        # mlp embed the one-hots
+        obervation_embedded = self.mlp_embedder(obervation_onehot)
+        # position encoding
+        batch_size, seq_length, feat_size = obervation_embedded.shape
+        position_encodings = sinusoidal_position_encoding(batch_size, seq_length, feat_size)
+        if isinstance(position_encodings, np.ndarray):
+            position_encodings = torch.from_numpy(position_encodings).to(obervation_embedded.device)
+        # add position encoding to circuits_onehot
+        obervation_position_embedded = obervation_embedded + position_encodings
+        # Transformer Encoder 
+        obervation_position_embedded = obervation_position_embedded.permute(1, 0, 2)
+        output = self.TransformerEncoder(obervation_position_embedded)
         
         return output 
+    
+    def Cir2onehot(self, circuit_stack, batch_size, max_length_circuit):
+        ## convert circuit to one-hot encoding
+        #
+        gate = circuit_stack[:, :, 0]
+        control = circuit_stack[:, :, 1]
+        target = circuit_stack[:, :, 2]
+
+        gate_onehot = F.one_hot(gate, num_classes=self.num_gateTypess)
+        control_onehot = F.one_hot(control, num_classes=self.num_qubits)
+        target_onehot = F.one_hot(target, num_classes=self.num_qubits)
+
+        ##
+        # one-hot encoding for gate: [gate_type, control, target]
+        # circuits_onehot.shape : [batch_size, length_circuit, gates_onehot]
+        circuits_onehot = torch.cat([gate_onehot, control_onehot, target_onehot], dim=-1)
+
+        ## padding
+        # 
+        if circuits_onehot.shape[1] < max_length_circuit:
+            padding = torch.zeros(batch_size, max_length_circuit - circuits_onehot.shape[1], circuits_onehot.shape[2])
+            circuits_onehot = torch.cat([circuits_onehot, padding], dim=1)   
+        
+        assert circuits_onehot.shape == (batch_size, max_length_circuit, gate_onehot.shape[-1] + control_onehot.shape[-1] + target_onehot.shape[-1]), \
+        "Shape mismatch in circuits stack one-hot encoding."
+        return circuits_onehot
+    
+def sinusoidal_position_encoding(batch_size, seq_length, feat_size):
+    ## generate position encoding
+    #
+    position_enc = np.array([
+        [pos / np.power(10000, 2. * i / feat_size) for i in range(feat_size)]
+        for pos in range(seq_length)])
+    position_enc[:, 0::2] = np.sin(position_enc[:, 0::2])  # dim 2i
+    position_enc[:, 1::2] = np.cos(position_enc[:, 1::2])  # dim 2i+1
+    
+    position_encodings = np.broadcast_to(position_enc, (batch_size, seq_length, feat_size))
+    return position_encodings
 
 class PolicyNetwork(torch.nn.Module):
-    def __init__(self, num_actions, embedding_dim=512, num_layers=2):
+    def __init__(self, 
+                 action_space_size, 
+                 embedding_dim, 
+                 num_layers=2
+        ):
         super(PolicyNetwork, self).__init__()
         self.embedding_dim = embedding_dim
         self.num_layers = num_layers
-        self.num_actions = num_actions
+        self.output_size = action_space_size
 
-        # 定义MLP结构
+        ## define mlp
         layers = []
         input_dim = embedding_dim
-
         for _ in range(num_layers):
             layers.append(torch.nn.Linear(input_dim, embedding_dim))
             layers.append(torch.nn.ReLU())
             input_dim = embedding_dim
-        
-        # 将layers组合成Sequential
+
         self.mlp = torch.nn.Sequential(*layers)
         
-        # 定义输出层
-        self.output_layer = torch.nn.Linear(embedding_dim, num_actions)
+        ## define output layer
+        self.output_layer = torch.nn.Linear(embedding_dim, self.output_size)
 
     def forward(self, x):
         x = self.mlp(x)
         x = self.output_layer(x)
         return x
+
 
 class DistributionSupport(object):
 
@@ -206,13 +275,14 @@ class DistributionSupport(object):
         self.full_support_size = 2 * num_bins + 1
 
     @property  
-    def support(self) -> float:
+    def support(self) -> np.ndarray:
         delta = self.value_max - self.value_min / (self.full_support_size)      
         return np.array([self.value_min + i * delta for i in range(self.full_support_size)], dtype="float32")
 
 class CategoricalNet(torch.nn.Module):
-    """A head that represents continuous values by a categorical distribution."""
-
+    ## output is categorical distribution
+    # prediction of vlaue based on the distribution 
+    # instead of the value directly
     def __init__(
         self,
         embedding_dim: int,
@@ -222,10 +292,11 @@ class CategoricalNet(torch.nn.Module):
     ):
         super().__init__(name=name)
         self._value_support = support
-        self._embedding_dim = embedding_dim
+        self.input_dim = embedding_dim
         self.num_layers = num_layers
         self.output_size = self._value_support.full_support_size
 
+        ## define mlp
         layers = []
         input_dim = self._embedding_dim
 
@@ -234,55 +305,74 @@ class CategoricalNet(torch.nn.Module):
             layers.append(torch.nn.ReLU())
             input_dim = embedding_dim
 
-        output_layer = torch.nn.Linear(self._embedding_dim, self.output_size)
+        ## define output layer
+        output_layer = torch.nn.Linear(embedding_dim, self.output_size)
         layers += output_layer
         
-        # 将layers组合成Sequential
-        self.Net = torch.nn.Sequential(*layers)
+        self.CateNet = torch.nn.Sequential(*layers)
 
 
     def forward(self, x):
-        # For training returns the logits, for inference the mean.
-        logits = self.Net(x)
+        # For training returns the logits
+        # For inference the mean
+        logits = self.CateNet(x)
+        ## weighted mean
         probs = torch.nn.softmax(logits)
         support = torch.tensor(self._value_support.support, device=x.device)
-        mean = torch.sum(probs * support, dim=-1)  # 广播并加权求和
+        mean = torch.sum(probs * support, dim=-1)  
         return dict(logits=logits, mean=mean)
 
   
 class AlphaDevNetwork(AbstractNetwork):
     def __init__(
         self,
-        action_space_size,
-        max_length_circuit,
-        embedding_dim,  # 512
-        support_size,
-
-        ## net acrhitecture
-        #
-        representation_layers,
+        ## basic params
+        num_qubits,
+        action_space_size, 
+        value_max,
+        value_min,
+        ## shape of observation
+        batch_size,
+        max_length_circuit, 
+        ## represent net params
+        input_dim, ## feat_size
+        embedding_dim, 
+        num_encoderLayer,
+        nhead,  # 4
+        ## predict net params
         policy_layers,
         correctness_value_layers,
         cirlength_value_layers,
+        support_size,
 
+        ## ???
         observation_shape,
         stacked_observations,
         encoding_size,
         
     ):
         super().__init__()
+        self.num_qubits = num_qubits
         self.action_space_size = action_space_size
-        
-        self.support = DistributionSupport(value_max=1, value_min=0, num_bins=support_size)
+        self.max_length_circuit = max_length_circuit
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.num_encoderLayer = num_encoderLayer
+        self.nhead = nhead
+        self.batch_size = batch_size 
+        self.support = DistributionSupport(value_max, value_min, num_bins=support_size)
         self.full_support_size = self.support.full_support_size
 
         self.representation_network = torch.nn.DataParallel(
             RepresentNet_Trans(
-                action_space_size,
-                max_length_circuit,
-                embedding_dim,
-                representation_layers,                                                             
-                                                                                                                         
+                self.batch_size,
+                self.num_qubits,
+                self.action_space_size, 
+                self.max_length_circuit, 
+                self.input_dim, ## feat_size
+                self.embedding_dim, 
+                self.num_encoderLayer,
+                self.nhead,                                                                                                                                                               
         )
             )
 
@@ -295,7 +385,6 @@ class AlphaDevNetwork(AbstractNetwork):
         )     
             )
         
-
         self.correctness_value_network = torch.nn.DataParallel(
             CategoricalNet(  
                 embedding_dim,
@@ -324,8 +413,6 @@ class AlphaDevNetwork(AbstractNetwork):
     def representation(self, observation):
         return self.representation_network(observation)
         
-
-    
     def initial_inference(self, observation):
         encoded_state = self.representation(observation)
         policy_logits, value, correctness_value_logits, cirlength_value_logits = self.prediction(encoded_state)
@@ -336,10 +423,9 @@ class AlphaDevNetwork(AbstractNetwork):
             value,
             correctness_value_logits, 
             cirlength_value_logits
-
         )
 
-    def recurrent_inference(self, encoded_state, action):
+    def recurrent_inference(self):
         pass
 
 
