@@ -141,8 +141,8 @@ class CircuitSys(AbstractGame):
                        correctness_reward_weight = 1.0, # float = 1.0,
                        alpha: float = 0.1, # length reward coefficient
                        length_threshold: int = 10, # synthesized circuit length threshold
-                       gateSet = [["H", 0], ["S", 0], ["T", 0], ["S†", 0], ["T†", 0], ["CX", [0, 1]], 
-                                  ["H", 1], ["S", 1], ["T", 1], ["S†", 1], ["T†", 1], ["CX", [1, 0] ]], #Clifford + T gate
+                       gateSet = [["H", 0, 0], ["S", 0, 0], ["T", 0, 0], ["S†", 0, 0], ["T†", 0, 0], ["CX", 1, 0], 
+                                  ["H", 1, 1], ["S", 1, 1], ["T", 1, 1], ["S†", 1, 1], ["T†", 1, 1], ["CX", 0, 1]], #Clifford + T gate: [gate, control_bit, target_bit]
                        render_model = None, # Visual mode
                        target = qlib.QFT #QFT
                  ):
@@ -167,6 +167,7 @@ class CircuitSys(AbstractGame):
         self.ideal_OutputState = [] ## ideal output state of QFT acting on the initial states
         self.qc = QuantumCircuit(self.n_qubit)
         self.actions = [] # index of gateSet
+        self.operations = [] # specific gate i.e. ["H", 0]
         self.state = [] # consist of one-hot of actions
         self.previous_correct_items = 0
 
@@ -240,13 +241,6 @@ class CircuitSys(AbstractGame):
             return -1.0
         return 0.0
         
-
-    def action_to_one_hot(self, action):
-        one_hot = np.zeros(len(self.gateSet))
-        if 0 <= action < len(self.gateSet):
-            one_hot[action] = 1
-        return one_hot
-
     def legal_actions(self):
 
         previous_action = self.actions[-1]
