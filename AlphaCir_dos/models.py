@@ -38,7 +38,32 @@ class MuZeroNetwork:
                 config.downsample,
             )
         elif config.network == "Transformer":
-            return AlphaDevNetwork()
+            return AlphaDevNetwork(
+                ##basic params
+                #
+                config.n_qubits,
+                len(config.action_space),
+                config.value_max,
+                config.value_min,   
+                ## shape of observation
+                #
+                config.batch_size,
+                config.max_length_circuit,
+                ## represent net params
+                #
+                config.input_dim,
+                config.embedding_dim,
+                config.nhead,
+                config.num_encoderLayer,
+                ## predict net params
+                #
+                config.policy_layers,
+                ## value net params,
+                #
+                config.correctness_value_layers,
+                config.length_value_layers,
+                config.support_size,
+            )
 
 
         else:
@@ -72,10 +97,10 @@ class AbstractNetwork(ABC, torch.nn.Module):
     def recurrent_inference(self, encoded_state, action):
         pass
 
-    def get_weights(self):
+    def get_weights(self): # get network weights
         return dict_to_cpu(self.state_dict())
 
-    def set_weights(self, weights):
+    def set_weights(self, weights): # set network weights
         self.load_state_dict(weights)
 
 
@@ -265,7 +290,6 @@ class PolicyNetwork(torch.nn.Module):
         x = self.output_layer(x)
         return x
 
-
 class DistributionSupport(object):
 
     def __init__(self, value_max: float, value_min: float, num_bins: int):
@@ -348,7 +372,6 @@ class AlphaDevNetwork(AbstractNetwork):
         ## ???
         observation_shape,
         stacked_observations,
-        encoding_size,
         
     ):
         super().__init__()
@@ -415,18 +438,19 @@ class AlphaDevNetwork(AbstractNetwork):
         
     def initial_inference(self, observation):
         encoded_state = self.representation(observation)
-        policy_logits, value, correctness_value_logits, cirlength_value_logits = self.prediction(encoded_state)
+        policy_logits, value, correctness_value_logits, length_value_logits = self.prediction(encoded_state)
 
         return (
-            encoded_state,
-            policy_logits,
             value,
             correctness_value_logits, 
-            cirlength_value_logits
+            length_value_logits,
+            policy_logits,
         )
 
     def recurrent_inference(self):
-        pass
+        ## use dynamics net to get next_hidden_state
+        ## then use next_hidden_state to predict value, policy_logits
+        pass ## not be used in AlphaDevNetwork
 
 
 
@@ -1005,7 +1029,15 @@ def mlp(
         layers += [torch.nn.Linear(sizes[i], sizes[i + 1]), act()]
     return torch.nn.Sequential(*layers)
 
-    
+def supoprt_to_scalar_simply(logits, support_size):
+    """
+    Transform a categorical representation to a scalar
+    """
+    # Decode to a scalar
+    probabilities = torch.softmax(logits, dim=1)
+    support = torch.tensor([x for x in range(-support_size, support_size + 1)]).float().to(device=probabilities.device)
+    x = torch.sum(support * probabilities, dim=1, keepdim=True)
+    return x    
 
 
 def support_to_scalar(logits, support_size):
@@ -1041,6 +1073,21 @@ def scalar_to_support(x, support_size):
     x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1) + 0.001 * x
 
     # Encode on a vector
+    x = torch.clamp(x, -support_size, support_size)
+    floor = x.floor()
+    prob = x - floor
+    logits = torch.zeros(x.shape[0], x.shape[1], 2 * support_size + 1).to(x.device)
+    logits.scatter_(
+        2, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1)
+    )
+    indexes = floor + support_size + 1
+    prob = prob.masked_fill_(2 * support_size < indexes, 0.0)
+    indexes = indexes.masked_fill_(2 * support_size < indexes, 0.0)
+    logits.scatter_(2, indexes.long().unsqueeze(-1), prob.unsqueeze(-1))
+    return logits
+
+def scalar_to_support_simply(x, support_size):
+
     x = torch.clamp(x, -support_size, support_size)
     floor = x.floor()
     prob = x - floor

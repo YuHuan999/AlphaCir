@@ -24,7 +24,7 @@ import trainer
 class MuZero:
     """
     Main class to manage MuZero.
-
+    
     Args:
         game_name (str): Name of the game module, it should match the name of a .py file
         in the "./games" directory.

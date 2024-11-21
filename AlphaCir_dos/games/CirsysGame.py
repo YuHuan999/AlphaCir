@@ -16,27 +16,29 @@ class MuZeroConfig:
         # More information is available here: https://github.com/werner-duvaud/muzero-general/wiki/Hyperparameter-Optimization
 
         self.seed = 0  # Seed for numpy, torch and the game
-        self.max_num_gpus = None  # Fix the maximum number of GPUs to use. It's usually faster to use a single GPU (set it to 1) if it has enough memory. None will use every GPUs available
+        self.max_num_gpus = 1  # Fix the maximum number of GPUs to use. It's usually faster to use a single GPU (set it to 1) if it has enough memory. None will use every GPUs available
 
 
 
         ### Game
-        self.observation_shape = (1, 1, 4)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
-        self.action_space = list(range(2))  # Fixed list of all possible actions. You should only edit the length
-        self.players = list(range(1))  # List of players. You should only edit the length
+        # self.observation_shape = (1, 1, 4)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
+        self.n_qubits = 2 # number of qubits
+        # Clifford + T gate: [gate, control_bit, target_bit] for 2 qubits
+        self.real_actions = [["H", 0, 0], ["S", 0, 0], ["T", 0, 0], ["S†", 0, 0], ["T†", 0, 0], ["CX", 1, 0], 
+                                  ["H", 1, 1], ["S", 1, 1], ["T", 1, 1], ["S†", 1, 1], ["T†", 1, 1], ["CX", 0, 1]], 
+        self.action_space = list(range(self.real_actions))  # Fixed list of all possible actions index. 
+        self.players = [0]  # List of players. You should only edit the length
         self.stacked_observations = 0  # Number of previous observations and previous actions to add to the current observation
 
         # Evaluate
-        self.muzero_player = 0  # Turn Muzero begins to play (0: MuZero plays first, 1: MuZero plays second)
-        self.opponent = None  # Hard coded agent that MuZero faces to assess his progress in multiplayer games. It doesn't influence training. None, "random" or "expert" if implemented in the Game class
-
+        ## use a test set to evaluate the performance of the model
 
 
         ### Self-Play
-        self.num_workers = 1  # Number of simultaneous threads/workers self-playing to feed the replay buffer
+        self.num_workers = 128  # Number of simultaneous threads/workers self-playing to feed the replay buffer
         self.selfplay_on_gpu = False
-        self.max_moves = 500  # Maximum number of moves if game is not finished before
-        self.num_simulations = 50  # Number of future moves self-simulated
+        self.max_moves = 50  # Maximum number of moves if game is not finished before
+        self.num_simulations = 800  # Number of future moves self-simulated
         self.discount = 0.997  # Chronological discount of the reward
         self.temperature_threshold = None  # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
 
@@ -51,9 +53,20 @@ class MuZeroConfig:
 
 
         ### Network
-        self.network = "fullyconnected"  # "resnet" / "fullyconnected"
+        self.network = "Transformer"  # "resnet" / "fullyconnected / "Transformer"
         self.support_size = 10  # Value and reward are scaled (with almost sqrt) and encoded on a vector with a range of -support_size to support_size. Choose it so that support_size <= sqrt(max(abs(discounted reward)))
-        
+
+        # Transformer Network
+        self.value_max = 1
+        self.value_min = -1
+        self.input_dim = 8, ## not sure 
+        self.embedding_dim = 128,
+        self.nhead = 4 ,
+        self.num_encoderLayer = 3,
+        self.policy_layers = 2,
+        self.correctness_value_layers = 2,
+        self.length_value_layers = 2,
+
         # Residual Network
         self.downsample = False  # Downsample observations before representation network, False / "CNN" (lighter) / "resnet" (See paper appendix Network Architecture)
         self.blocks = 1  # Number of blocks in the ResNet
@@ -78,13 +91,14 @@ class MuZeroConfig:
         ### Training
         self.results_path = pathlib.Path(__file__).resolve().parents[1] / "results" / pathlib.Path(__file__).stem / datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")  # Path to store the model weights and TensorBoard logs
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
-        self.training_steps = 10000  # Total number of training steps (ie weights update according to a batch)
+        self.training_steps = 1000000  # Total number of training steps (ie weights update according to a batch)
         self.batch_size = 128  # Number of parts of games to train on at each training step
         self.checkpoint_interval = 10  # Number of training steps before using the model for self-playing
+        self.target_interval = 100  # Number of training steps before updating the target networks
         self.value_loss_weight = 1  # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
         self.train_on_gpu = torch.cuda.is_available()  # Train on GPU if available
 
-        self.optimizer = "Adam"  # "Adam" or "SGD". Paper uses SGD
+        self.optimizer = "SGD"  # "Adam" or "SGD". Paper uses SGD
         self.weight_decay = 1e-4  # L2 weights regularization
         self.momentum = 0.9  # Used only if optimizer is SGD
 
@@ -102,8 +116,8 @@ class MuZeroConfig:
         self.PER = True  # Prioritized Replay (See paper appendix Training), select in priority the elements in the replay buffer which are unexpected for the network
         self.PER_alpha = 0.5  # How much prioritization is used, 0 corresponding to the uniform case, paper suggests 1
 
-        # Reanalyze (See paper appendix Reanalyse)
-        self.use_last_model_value = True  # Use the last model to provide a fresher, stable n-step value (See paper appendix Reanalyze)
+        # Use the last model to provide a fresher, stable n-step value (See paper appendix Reanalyze)
+        self.use_last_model_value = False  ## this program is not necessary
         self.reanalyse_on_gpu = False
 
 
@@ -129,18 +143,87 @@ class MuZeroConfig:
         else:
             return 0.25
         
-class CircuitSys(AbstractGame):
+
+class Game(AbstractGame):
+    """
+    Game wrapper.
+    """
+
+    def __init__(self):
+        self.env = CircuitSys(
+                         n_qubit = 2,                        
+                         fidelity_threshold = 0.99,
+                         max_steps = 20,
+                         num_testSet = 20,
+                         seed = 0
+                         )
+
+    def step(self, action):
+        """
+        Apply action to the game.
+
+        Args:
+            action : action of the action_space to take.
+
+        Returns:
+            The new observation, the reward and a boolean if the game has ended.
+        """
+        is_target, observation, reward, done = self.env.step(action)
+        return is_target, observation, reward, done
+
+    def to_play(self):
+        """
+        Return the current player.
+        Player is always MCTS player in self-play.
+        Returns:
+            The current player, it should be an element of the players list in the config.
+        """
+        return 0
+
+    def legal_actions(self):
+        """
+        Should return the legal actions at each turn, if it is not available, it can return
+        the whole action space. At each turn, the game have to be able to handle one of returned actions.
+
+        For complex game where calculating legal moves is too long, the idea is to define the legal actions
+        equal to the action space but to return a negative reward if the action is illegal.
+
+        Returns:
+            An array of integers, subset of the action space.
+        """
+        return self.env.legal_actions()
+
+    def reset(self):
+        """
+        Reset the game for a new game.
+
+        Returns:
+            Initial observation of the game.
+        """
+        return self.env.reset()
+
+    def render(self):
+        """
+        Display the game observation.
+        """
+        self.env.render()
+
+
+
+
+  
+class CircuitSys:
     def __init__(self, 
                        n_qubit: int,
                        fidelity_threshold: float = 0.99,
-                       max_steps: int = 10,
-                       num_testSet: int = 20,
+                       max_steps: int = 20,
+                       num_testSet: int = 20, # equal to max_steps
                        seed: int = 0,
 
-                       correct_reward = 1.0, # additional reward for all correct
+                       correct_reward = 10.0, # additional reward for all correct
                        correctness_reward_weight = 1.0, # float = 1.0,
-                       alpha: float = 0.1, # length reward coefficient
-                       length_threshold: int = 10, # synthesized circuit length threshold
+                       alpha = 1.0,# length reward coefficient
+                       length_threshold = -1, # synthesized circuit length threshold
                        gateSet = [["H", 0, 0], ["S", 0, 0], ["T", 0, 0], ["S†", 0, 0], ["T†", 0, 0], ["CX", 1, 0], 
                                   ["H", 1, 1], ["S", 1, 1], ["T", 1, 1], ["S†", 1, 1], ["T†", 1, 1], ["CX", 0, 1]], #Clifford + T gate: [gate, control_bit, target_bit]
                        render_model = None, # Visual mode
@@ -154,7 +237,7 @@ class CircuitSys(AbstractGame):
         self.num_testSet = num_testSet ## number of test set
         self.seed = seed
 
-        self.correct_reward = correct_reward
+        self.correct_reward = correct_reward # additional reward for all correct
         self.correctness_reward_weight = correctness_reward_weight
         self.alpha = alpha # length reward coefficient
         self.length_threshold = length_threshold
@@ -168,7 +251,9 @@ class CircuitSys(AbstractGame):
         self.qc = QuantumCircuit(self.n_qubit)
         self.actions = [] # index of gateSet
         self.operations = [] # specific gate i.e. ["H", 0]
-        self.state = [] # consist of one-hot of actions
+        self.states = [] # consist of operations i.e. [["H", 0, 0], ["CX", 1, 0],...]
+        self.correstness_rewards = []
+        self.length_rewards = []
         self.previous_correct_items = 0
 
         ## preparing the testSet
@@ -299,40 +384,39 @@ class CircuitSys(AbstractGame):
         if gate == "CX": self.qc.cx(qubits[0], qubits[1])
         ## update state, state consist of one-hot of actions
         # 
-        self.state.append(self.action_to_one_hot(action))
+
+        self.state.append(operation) ## state i.e.: [["H",1, 0], ["CX", 1, 0],...] 
         ## calculate reward
         # 
-        reward, is_target = self.reward
+        corrcectness_reward, is_target = self.correctness_reward
+        length_reward = self.length_reward
+        self.correstness_rewards.append(corrcectness_reward)
+        self.length_rewards.append(length_reward)
+        
         ## check if the game is over
         #
         if len(self.actions) >= self.max_steps or is_target:
             done = self.close()
 
 
-        return is_target, self.state, reward, done
+        return is_target, self.state, corrcectness_reward, length_reward, done
 
     def to_play(self):
         ## always 1 player
         return 0
     
     def reset(self):
-        ## Call __init__ to reset all arguments and status
-        #
-        self.__init__(self.n_qubit, 
-                      self.fidelity_threshold,         
-                      self.max_steps,
-                      self.num_testSet,
-                      self.seed,
-                      self.correct_reward,
-                      self.correctness_reward_weight,
-                      self.alpha,
-                      self.length_threshold,
-                      self.gateSet,
-                      self.render_model,
-                      self.target)
-        ##Preparing the testSet, seed should not be the same？
-        #
-        # self.testSet_prepare()
+        ## reset the game
+        self.testSet = [] ## consist of random states as initial states 
+        self.qc = QuantumCircuit(self.n_qubit)
+        self.actions = [] # index of gateSet
+        self.operations = [] # specific gate i.e. ["H", 0]
+        self.states = [] # consist of operations i.e. [["H", 0, 0], ["CX", 1, 0],...]
+        self.correstness_rewards = []
+        self.length_rewards = []
+        self.previous_correct_items = 0
+
+        return self.states[0]
         
 
     def render(self, render = False):## render the boolen value

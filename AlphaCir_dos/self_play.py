@@ -6,7 +6,7 @@ import ray
 import torch
 
 import models
-
+import copy
 
 @ray.remote
 class SelfPlay:
@@ -16,7 +16,7 @@ class SelfPlay:
 
     def __init__(self, initial_checkpoint, Game, config, seed):
         self.config = config
-        self.game = Game(seed)
+        self.game = Game(seed = seed)
 
         # Fix random generator seed
         numpy.random.seed(seed)
@@ -51,6 +51,7 @@ class SelfPlay:
 
                 replay_buffer.save_game.remote(game_history, shared_storage)
 
+            ## test mode
             else:
                 # Take the best action (no exploration) in test mode
                 game_history = self.play_game(
@@ -108,16 +109,17 @@ class SelfPlay:
         self.close_game()
 
     def play_game(
-        self, temperature, temperature_threshold, render, opponent, muzero_player
+        self, temperature, temperature_threshold, render, muzero_player, opponent = "self"
     ):
         """
         Play one game with actions based on the Monte Carlo tree search at each moves.
         """
         game_history = GameHistory()
-        observation = self.game.reset()
-        game_history.action_history.append(0)
-        game_history.observation_history.append(observation)
-        game_history.reward_history.append(0)
+        state = self.game.reset()
+        game_history.action_history = self.game.actions
+        game_history.state_history.append(state)
+        game_history.correstness_reward_history = self.game.correstness_rewards ## correstness_rewards is list
+        game_history.length_reward_history = self.game.length_rewards ## length_rewards is list
         game_history.to_play_history.append(self.game.to_play())
 
         done = False
@@ -129,25 +131,24 @@ class SelfPlay:
             while (
                 not done and len(game_history.action_history) <= self.config.max_moves
             ):
-                assert (
-                    len(numpy.array(observation).shape) == 3
-                ), f"Observation should be 3 dimensionnal instead of {len(numpy.array(observation).shape)} dimensionnal. Got observation of shape: {numpy.array(observation).shape}"
-                assert (
-                    numpy.array(observation).shape == self.config.observation_shape
-                ), f"Observation should match the observation_shape defined in MuZeroConfig. Expected {self.config.observation_shape} but got {numpy.array(observation).shape}."
-                stacked_observations = game_history.get_stacked_observations(
-                    -1, self.config.stacked_observations, len(self.config.action_space)
-                )
+                # assert (
+                #     numpy.array(state).shape == self.config.observation_shape
+                # ), f"Observation should match the observation_shape defined in MuZeroConfig. Expected {self.config.observation_shape} but got {numpy.array(observation).shape}."
+                
+                stacked_observations = game_history.state_history[-1]
 
                 # Choose the action
                 if opponent == "self" or muzero_player == self.game.to_play():
+                    ## MCTS in real env
                     root, mcts_info = MCTS(self.config).run(
+                        self.game,
                         self.model,
                         stacked_observations,
                         self.game.legal_actions(),
                         self.game.to_play(),
-                        True,
+                        True, #add exploration noise
                     )
+
                     action = self.select_action(
                         root,
                         temperature
@@ -161,12 +162,12 @@ class SelfPlay:
                         print(
                             f"Root value for player {self.game.to_play()}: {root.value():.2f}"
                         )
-                else:
+                
+                else: ## ignore
                     action, root = self.select_opponent_action(
-                        opponent, stacked_observations
-                    )
-
-                observation, reward, done = self.game.step(action)
+                        opponent, stacked_observations )
+                
+                is_target, state, correstness_reward, length_reward, done = self.game.step(action)
 
                 if render:
                     print(f"Played action: {self.game.action_to_string(action)}")
@@ -175,9 +176,9 @@ class SelfPlay:
                 game_history.store_search_statistics(root, self.config.action_space)
 
                 # Next batch
-                game_history.action_history.append(action)
-                game_history.observation_history.append(observation)
-                game_history.reward_history.append(reward)
+                game_history.state_history.append(state)
+                game_history.correstness_reward_history.append(correstness_reward)
+                game_history.length_reward_history.append(length_reward)
                 game_history.to_play_history.append(self.game.to_play())
 
         return game_history
@@ -195,7 +196,7 @@ class SelfPlay:
                 stacked_observations,
                 self.game.legal_actions(),
                 self.game.to_play(),
-                True,
+                True, 
             )
             print(f'Tree depth: {mcts_info["max_tree_depth"]}')
             print(f"Root value for player {self.game.to_play()}: {root.value():.2f}")
@@ -256,9 +257,11 @@ class MCTS:
 
     def __init__(self, config):
         self.config = config
+        
 
     def run(
         self,
+        game,   
         model,
         observation,
         legal_actions,
@@ -266,16 +269,18 @@ class MCTS:
         add_exploration_noise,
         override_root_with=None,
     ):
+        """Runs the Monte Carlo Tree Search algorithm.
+
+        To decide on an action, we run N simulations, always starting at the root of
+        the search tree and traversing the tree according to the UCB formula until we
+        reach a leaf node.
         """
-        At the root of the search tree we use the representation function to obtain a
-        hidden state given the current observation.
-        We then run a Monte Carlo Tree Search using only action sequences and the model
-        learned by the network.
-        """
+
         if override_root_with:
             root = override_root_with
             root_predicted_value = None
         else:
+            ## initialize the root node
             root = Node(0)
             observation = (
                 torch.tensor(observation)
@@ -283,28 +288,24 @@ class MCTS:
                 .unsqueeze(0)
                 .to(next(model.parameters()).device)
             )
-            (
-                root_predicted_value,
-                reward,
-                policy_logits,
-                hidden_state,
+            (   
+                root_predicted_value, ## value = correctness_value["mean"] + cirlength_value["mean"]
+                correctness_value_logits,
+                length_value_logits, 
+                policy_logits,  
             ) = model.initial_inference(observation)
-            root_predicted_value = models.support_to_scalar(
-                root_predicted_value, self.config.support_size
-            ).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
+
             assert (
                 legal_actions
             ), f"Legal actions should not be an empty array. Got {legal_actions}."
             assert set(legal_actions).issubset(
                 set(self.config.action_space)
             ), "Legal actions should be a subset of the action space."
+            
             root.expand(
                 legal_actions,
                 to_play,
-                reward,
                 policy_logits,
-                hidden_state,
             )
 
         if add_exploration_noise:
@@ -313,18 +314,22 @@ class MCTS:
                 exploration_fraction=self.config.root_exploration_fraction,
             )
 
+        ## run in mcts 
         min_max_stats = MinMaxStats()
-
         max_tree_depth = 0
         for _ in range(self.config.num_simulations):
             virtual_to_play = to_play
             node = root
             search_path = [node]
             current_tree_depth = 0
+            game_inside = copy.deepcopy(game)
 
             while node.expanded():
                 current_tree_depth += 1
                 action, node = self.select_child(node, min_max_stats)
+                is_target, state, corrcectness_reward, length_reward, done = game_inside.step(action)
+                node.correctness_reward = corrcectness_reward
+                node.length_reward = length_reward  
                 search_path.append(node)
 
                 # Players play turn by turn
@@ -333,24 +338,22 @@ class MCTS:
                 else:
                     virtual_to_play = self.config.players[0]
 
-            # Inside the search tree we use the dynamics function to obtain the next hidden
-            # state given an action and the previous hidden state
-            parent = search_path[-2]
-            value, reward, policy_logits, hidden_state = model.recurrent_inference(
-                parent.hidden_state,
-                torch.tensor([[action]]).to(parent.hidden_state.device),
-            )
-            value = models.support_to_scalar(value, self.config.support_size).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
+            # Inside the search tree we use the environment to obtain the next
+            # observation and reward given an action.
+            
+            state = game_inside.states[-1]
+            legal_actions = game_inside.legal_actions()
+            value, correctness_value_logits, length_value_logits, policy_logits = model.initial_inference(state)
+            correctness_value = model.support_to_scalar_simply(correctness_value_logits, self.config.support_size)
+            length_value = model.support_to_scalar_simply(length_value_logits, self.config.support_size)
+            
             node.expand(
-                self.config.action_space,
+                legal_actions,
                 virtual_to_play,
-                reward,
-                policy_logits,
-                hidden_state,
+                policy_logits
             )
 
-            self.backpropagate(search_path, value, virtual_to_play, min_max_stats)
+            self.backpropagate(search_path, value, correctness_value, length_value, virtual_to_play, min_max_stats)
 
             max_tree_depth = max(max_tree_depth, current_tree_depth)
 
@@ -403,18 +406,20 @@ class MCTS:
 
         return prior_score + value_score
 
-    def backpropagate(self, search_path, value, to_play, min_max_stats):
+    def backpropagate(self, search_path, value, correctness_value, length_value,  to_play, min_max_stats):
         """
         At the end of a simulation, we propagate the evaluation all the way up the tree
         to the root.
         """
         if len(self.config.players) == 1:
             for node in reversed(search_path):
-                node.value_sum += value
+                node.correctness_value_sum += correctness_value
+                node.length_value_sum += length_value
                 node.visit_count += 1
-                min_max_stats.update(node.reward + self.config.discount * node.value())
+                min_max_stats.update(node.reward + self.config.discount * node.value())  
+                correctness_value = node.correctness_reward + self.config.discount * correctness_value
+                length_value = node.length_reward + self.config.discount * length_value
 
-                value = node.reward + self.config.discount * value
 
         elif len(self.config.players) == 2:
             for node in reversed(search_path):
@@ -435,10 +440,17 @@ class Node:
         self.visit_count = 0
         self.to_play = -1
         self.prior = prior
-        self.value_sum = 0
+        self.value = 0
+        self.correctness_value_sum = 0
+        self.correctness_value = 0
+        self.length_value_sum = 0
+        self.length_value = 0
         self.children = {}
         self.hidden_state = None
-        self.reward = 0
+        self.correctness_reward = 0
+        self.length_reward = 0
+        
+        
 
     def expanded(self):
         return len(self.children) > 0
@@ -446,16 +458,16 @@ class Node:
     def value(self):
         if self.visit_count == 0:
             return 0
-        return self.value_sum / self.visit_count
+        self.correctness_value = self.correctness_value_sum / self.visit_count
+        self.length_value = self.length_value_sum / self.visit_count    
+        self.value = self.correctness_value + self.length_value
+        return self.value
 
-    def expand(self, actions, to_play, reward, policy_logits, hidden_state):
+    def expand(self, actions, to_play, policy_logits):
         """
-        We expand a node using the value, reward and policy prediction obtained from the
-        neural network.
+        We expand nodes next layer based the legal actions and policy distribution by NN.
         """
         self.to_play = to_play
-        self.reward = reward
-        self.hidden_state = hidden_state
 
         policy_values = torch.softmax(
             torch.tensor([policy_logits[0][a] for a in actions]), dim=0
@@ -484,10 +496,12 @@ class GameHistory:
     def __init__(self):
         self.observation_history = []
         self.action_history = []
-        self.reward_history = []
+        self.correstness_reward_history = []
+        self.length_reward_history = []
         self.to_play_history = []
         self.child_visits = []
-        self.root_values = []
+        self.root_correctness_values = []
+        self.root_length_values = []
         self.reanalysed_predicted_root_values = None
         # For PER
         self.priorities = None
@@ -505,10 +519,14 @@ class GameHistory:
                     for a in action_space
                 ]
             )
-
-            self.root_values.append(root.value())
+            root.value() ## update the value of root
+            self.root_correctness_values.append(root.correctness_value)
+            self.root_length_values.append(root.length_value)
         else:
-            self.root_values.append(None)
+            # self.root_values.append(None)
+            root.value() ## update the value of root
+            self.root_correctness_values.append(None)
+            self.root_length_values.append(None)
 
     def get_stacked_observations(
         self, index, num_stacked_observations, action_space_size
@@ -516,6 +534,9 @@ class GameHistory:
         """
         Generate a new observation with the observation at the index position
         and num_stacked_observations past observations and actions stacked.
+        
+        observation is  circuit
+        
         """
         # Convert to positive index
         index = index % len(self.observation_history)

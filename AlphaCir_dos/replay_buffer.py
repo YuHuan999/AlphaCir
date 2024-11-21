@@ -29,7 +29,8 @@ class ReplayBuffer:
 
         # Fix random generator seed
         numpy.random.seed(self.config.seed)
-
+    
+    ## finish a game save the game
     def save_game(self, game_history, shared_storage=None):
         if self.config.PER:
             if game_history.priorities is not None:
@@ -67,24 +68,26 @@ class ReplayBuffer:
     def get_buffer(self):
         return self.buffer
 
+    #### 这里, 了解如何 get batch
     def get_batch(self):
         (
             index_batch,
             observation_batch,
             action_batch,
-            reward_batch,
-            value_batch,
+            correctness_value_batch,
+            length_value_batch,
             policy_batch,
             gradient_scale_batch,
         ) = ([], [], [], [], [], [], [])
         weight_batch = [] if self.config.PER else None
 
         for game_id, game_history, game_prob in self.sample_n_games(
-            self.config.batch_size
+            self.config.batch_size ## batch_size = n_games
         ):
             game_pos, pos_prob = self.sample_position(game_history)
 
-            values, rewards, policies, actions = self.make_target(
+            ## 这里准备 correctness_value length_value
+            correctness_values, length_values, policies, actions = self.make_target(
                 game_history, game_pos
             )
 
@@ -97,8 +100,8 @@ class ReplayBuffer:
                 )
             )
             action_batch.append(actions)
-            value_batch.append(values)
-            reward_batch.append(rewards)
+            correctness_value_batch.append(correctness_values)
+            length_value_batch.append(length_values)
             policy_batch.append(policies)
             gradient_scale_batch.append(
                 [
@@ -129,8 +132,8 @@ class ReplayBuffer:
             (
                 observation_batch,
                 action_batch,
-                value_batch,
-                reward_batch,
+                correctness_value_batch,
+                length_value_batch,
                 policy_batch,
                 weight_batch,
                 gradient_scale_batch,
@@ -226,59 +229,66 @@ class ReplayBuffer:
                 self.buffer[game_id].game_priority = numpy.max(
                     self.buffer[game_id].priorities
                 )
-
+    ## target value = discounted future value + discounted sum of rewards
     def compute_target_value(self, game_history, index):
         # The value target is the discounted root value of the search tree td_steps into the
         # future, plus the discounted sum of all rewards until then.
         bootstrap_index = index + self.config.td_steps
-        if bootstrap_index < len(game_history.root_values):
-            root_values = (
-                game_history.root_values
-                if game_history.reanalysed_predicted_root_values is None
-                else game_history.reanalysed_predicted_root_values
-            )
-            last_step_value = (
-                root_values[bootstrap_index]
-                if game_history.to_play_history[bootstrap_index]
-                == game_history.to_play_history[index]
-                else -root_values[bootstrap_index]
-            )
+        if bootstrap_index < len(game_history.correstness_values):
+            correstness_values = game_history.correstness_values
+            length_values = game_history.length_values
 
-            value = last_step_value * self.config.discount**self.config.td_steps
+            ## future consider
+            ## set reanalysed_predicted_root_values None
+            #  use the last model to provide the value after n-step
+            #  if game_history.reanalysed_predicted_root_values is None 
+            #  else game_history.reanalysed_predicted_root_values
+            
+
+            
+            last_step_correstness = correstness_values[bootstrap_index] # only one player in this game 
+            last_step_length = length_values[bootstrap_index]
+
+            value_correstness = last_step_correstness * self.config.discount**self.config.td_steps
+            value_length = last_step_length * self.config.discount**self.config.td_steps
         else:
-            value = 0
+            value_correstness, value_length  = 0
 
-        for i, reward in enumerate(
-            game_history.reward_history[index + 1 : bootstrap_index + 1]
-        ):
+        for i, correctness_reward in enumerate(
+            game_history.correstness_reward_history[index + 1 : bootstrap_index + 1]
+        ):  
+            length_reward = game_history.length_reward_history[i]
+
             # The value is oriented from the perspective of the current player
-            value += (
-                reward
-                if game_history.to_play_history[index]
-                == game_history.to_play_history[index + i]
-                else -reward
+            value_correstness += (
+                # reward
+                # if game_history.to_play_history[index]
+                # == game_history.to_play_history[index + i]
+                # else -reward
+                correctness_reward # only one player in this game
             ) * self.config.discount**i
-
-        return value
-
+            value_length += (
+                length_reward 
+            ) * self.config.discount**i
+        return value_correstness, value_length
     def make_target(self, game_history, state_index):
         """
         Generate targets for every unroll steps.
         """
-        target_values, target_rewards, target_policies, actions = [], [], [], []
+        target_correctness_values, target_length_values, target_policies, actions = [], [], [], []
         for current_index in range(
             state_index, state_index + self.config.num_unroll_steps + 1
         ):
-            value = self.compute_target_value(game_history, current_index)
+            value_correctness, value_length = self.compute_target_value(game_history, current_index)
 
             if current_index < len(game_history.root_values):
-                target_values.append(value)
-                target_rewards.append(game_history.reward_history[current_index])
+                target_correctness_values.append(value_correctness)
+                target_length_values.append(value_length)
                 target_policies.append(game_history.child_visits[current_index])
                 actions.append(game_history.action_history[current_index])
             elif current_index == len(game_history.root_values):
-                target_values.append(0)
-                target_rewards.append(game_history.reward_history[current_index])
+                target_correctness_values.append(0)
+                target_length_values.append(0)
                 # Uniform policy
                 target_policies.append(
                     [
@@ -289,8 +299,8 @@ class ReplayBuffer:
                 actions.append(game_history.action_history[current_index])
             else:
                 # States past the end of games are treated as absorbing states
-                target_values.append(0)
-                target_rewards.append(0)
+                target_correctness_values.append(0)
+                target_length_values.append(0)
                 # Uniform policy
                 target_policies.append(
                     [
@@ -300,7 +310,7 @@ class ReplayBuffer:
                 )
                 actions.append(numpy.random.choice(self.config.action_space))
 
-        return target_values, target_rewards, target_policies, actions
+        return target_correctness_values, target_length_values, target_policies, actions
 
 
 @ray.remote
