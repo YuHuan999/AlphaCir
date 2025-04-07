@@ -6,6 +6,267 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import Dict, NamedTuple
+#################################################################
+#################### AlphaCirNetwork-Start- #####################
+
+###Network helpers
+class Action(object):
+  """Action representation."""
+
+  def __init__(self, index: int):
+    self.index = index
+
+  def __hash__(self):
+    return self.index
+
+  def __eq__(self, other):
+    return self.index == other.index
+
+  def __gt__(self, other):
+    return self.index > other.index
+
+class NetworkOutput(NamedTuple):
+  value: np.ndarray
+  fiedlity_value_logits: np.ndarray
+  length_value_logits: np.ndarray  ## 代表执行动作后余下的电路长短
+  policy_logits: Dict[Action, float] 
+
+
+class AlphaCirNetwork(nn.Module):
+    def __init__(self, hparams_r, hparams_p, task_spec):
+        super().__init__()
+        self.representation = AlphaCirRepNet(
+            hparams_r, task_spec, hparams_r.embedding_dim
+        )
+        self.prediction = AlphaCirPreNet(
+            hparams_p,
+            task_spec=task_spec,
+            embedding_dim=hparams_p.embedding_dim,
+        )
+
+    def inference(self, observation):
+        embedding = self.representation(observation)
+        return self.prediction(embedding)
+
+    def get_params(self):
+        return self.state_dict()
+
+    def update_params(self, updates_dict):
+        self.load_state_dict(updates_dict)
+
+    def training_steps(self):
+        pass  
+
+
+class UniformNetwork(nn.Module):
+    """
+    UniformNetwork: 测试pipeline, 始终返回固定输出。
+    """
+
+    def __init__(self, num_actions: int):
+        super().__init__()
+        self.num_actions = num_actions
+        self.params = {}  # 占位参数字典
+
+    def inference(self, observation: torch.Tensor) -> NetworkOutput:
+        batch_size = observation.shape[0] if observation.ndim > 1 else 1
+
+        outputs = [ NetworkOutput(
+        value=np.zeros(self.num_actions),
+        fiedlity_value_logits=np.zeros(self.num_actions),
+        length_value_logits=np.zeros(self.num_actions),
+        policy_logits={Action(a): 1.0 / self.num_actions for a in range(self.num_actions)}) 
+        for _ in range(batch_size)]
+
+        return outputs
+    
+    def get_params(self):
+        return self.params
+
+    def update_params(self, updates) -> None:
+        # 这里没有真正的参数可以更新，不过提供接口以保持一致
+        self.params = updates
+
+    def training_steps(self) -> int:
+        return 0  # 不训练
+
+
+
+###Representation Network
+class MultiQueryAttentionBlock(torch.nn.Module):
+    """
+    - Multi-Query Attention Layer:
+    - Multi-head Q
+    - Shared K and V
+    """
+    def __init__(self, hid_dim, n_heads, dropout, device):
+        super().__init__()
+        
+        assert hid_dim % n_heads == 0
+        
+        self.hid_dim = hid_dim
+        self.n_heads = n_heads
+        self.head_dim = self.hid_dim // self.n_heads
+
+        self.fc_q = torch.nn.Linear( self.hid_dim, self.hid_dim)
+        self.fc_k = torch.nn.Linear( self.hid_dim, self.head_dim)
+        self.fc_v = torch.nn.Linear(self.hid_dim, self.head_dim)  
+        self.fc_o = torch.nn.Linear(self.hid_dim, self.hid_dim)
+        
+        self.dropout = torch.nn.Dropout(dropout)
+        
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(device)
+        
+    def forward(self, query, key, value, mask = None):
+        
+        batch_size = query.shape[0]
+        
+        #query = [batch size, query len, hid dim]
+        #key = [batch size, key len, hid dim]
+        #value = [batch size, value len, hid dim]
+               
+        Qbank = self.fc_q(query).view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        Kbank = self.fc_k(key).view(batch_size, -1, 1, self.head_dim).permute(0, 2, 3, 1)
+        Vbank = self.fc_v(value).view(batch_size, -1, 1, self.head_dim).permute(0, 2, 1, 3)   
+        
+        #Qbank = [batch size, n heads, query len, head dim]
+        #Kbank = [batch size, 1, head dim, key len]
+        #Vbank = [batch size, 1, value len, head dim]
+
+        energy = torch.matmul(Qbank, Kbank) / self.scale
+
+        #energy = [batch size, n heads, query len, key len]
+        
+        if mask is not None:
+            energy = energy.masked_fill(mask == 0, -1e10)
+        
+        attention = F.softmax(energy, dim = -1)
+                
+        #attention = [batch size, n heads, query len, key len]
+
+        x = torch.matmul(self.dropout(attention), Vbank)
+        x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.view(batch_size, -1, self.hid_dim)     
+        #x = [batch size, seq len, hid dim]
+        
+        x = self.fc_o(x)
+        return x, attention
+
+
+class AlphaCirRepNet(nn.Module):
+    def __init__(self, hparam_r, task_spec, embedding_dim):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.num_gate_types = task_spec.num_ops  # 比如 ['H', 'CX', 'T', 'Tdg', ...]
+        self.num_qubits = task_spec.num_qubits  # 量子比特数量
+        self.max_circuit_length = task_spec.max_circuit_length
+        self.pooling = "last"  # 'mean', 'last', 'cls' ## 获取最后一个门
+        
+        # 嵌入层        
+        self.input_dim = hparam_r.input_dim  # 输入维度，通常是门的 one-hot 编码长度
+        self.num_mqa_blocks = hparam_r.num_mqa_blocks  # MQA 的数量
+        self.num_heads = hparam_r.num_heads  # MQA 的头数
+        self.dropout = hparam_r.dropout  # dropout 概率
+        self.device = hparam_r.device  # 设备类型（CPU 或 GPU）
+
+
+        ## circuit embedding
+        ## 先经过mlp -> a
+        self.mlp_embedder = nn.Sequential(
+            nn.Linear(self.input_dim, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim)
+        )
+
+        ## 在经过MQAttention -> b
+        self.mqas_embedder = nn.ModuleList([
+        MultiQueryAttentionBlock(
+        embed_dim=self.embedding_dim,
+        n_heads=self.num_heads,
+        dropout=self.dropout,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    for _ in range(self.num_mqa_blocks)
+    ])
+
+
+
+
+    def forward(self, inputs):   ## inputs:至少包含一batch的电路，以及每一个电路的长度组成的集合
+        circuits = inputs["circuits"]  # 电路数据
+        circuits_length = torch.as_tensor(inputs["circuits_length"], device=self.device)  # 程序长度
+        batch_size = circuits.shape[0]  # 批大小
+        max_length_circuit = self.max_circuit_length  # 最大电路长度
+
+        embedded_mlp = self.mlp_embedder(circuits) 
+        
+        _, seq_size, feat_size = embedded_mlp.shape
+
+        pos_enc = self.get_position_encoding(seq_size, feat_size, embedded_mlp.device)  ## take care of device
+        embedded = embedded_mlp + pos_enc.unsqueeze(0) 
+
+        for i in range(self.num_mqa_blocks):
+            embedded, _ = self.mqas_embedder[i](embedded, embedded, embedded)
+
+        batch_size = embedded.size(0) ## 只留最后一个门
+        idx = (circuits_length - 1).clamp(min=0, max=self.max_circuit_length - 1)
+        batch_idx = torch.arange(batch_size, device=embedded.device)
+        output = embedded[batch_idx, idx] 
+
+        return output  # [batch_size, embedding_dim]    
+
+
+    
+    
+    def circuits2onehot(self, circuits, batch_size, max_length_circuit):
+        # 将动作转换为 one-hot 编码
+        gates= circuits[:, :, 0]
+        locations = circuits[:, :, 1]
+        control = circuits[:, :, 2]
+
+        gates_one_hot = F.one_hot(gates, num_classes=self.num_gate_types).float()
+        locations_one_hot = F.one_hot(locations, num_classes=self.num_qubits).float()
+        control_one_hot = F.one_hot(control, num_classes=self.num_qubits).float()  ##考虑单量子比特门控制比特onehot为零
+
+        circuits_onehot = torch.cat([gates_one_hot, locations_one_hot, control_one_hot], dim=-1)
+
+
+        assert circuits_onehot.shape[:2] == (batch_size, max_length_circuit), \
+                    f"Shape mismatch: got {circuits_onehot.shape}, expected ({batch_size}, {max_length_circuit}, ?)"
+        return circuits_onehot
+    
+    
+    def get_position_encoding(self, seq_len, dim, device):
+        """
+        获取 sinusoidal 位置编码，shape 为 [seq_len, dim]
+        """
+        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)  # [seq_len, 1]
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / dim))
+    
+        pe = torch.zeros(seq_len, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维
+        pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维
+    
+        return pe  # [seq_len, dim]
+
+
+
+
+class AlphaCirPreNet(nn.Module):
+    pass
+
+
+
+
+
+
+
+
+
+#################################################################
+#####################  AlphaCirNetwork-End- #########################
 class MuZeroNetwork:
     def __new__(cls, config):
         if config.network == "fullyconnected":
@@ -106,63 +367,7 @@ class AbstractNetwork(ABC, torch.nn.Module):
 
 ##################################
 ######## AlphaDevNetwork #########
-class MultiQueryAttentionLayer(torch.nn.Module):
-    def __init__(self, hid_dim, n_heads,  dropout, device):
-        super().__init__()
-        
-        assert hid_dim % n_heads == 0
-        
-        self.hid_dim = hid_dim
-        self.n_heads = n_heads
-        self.head_dim = self.hid_dim // self.n_heads
 
-        self.fc_q = torch.nn.Linear( self.hid_dim, self.hid_dim)
-        self.fc_k = torch.nn.Linear( self.hid_dim, self.head_dim)
-        self.fc_v = torch.nn.Linear(self.hid_dim, self.head_dim)  
-        self.fc_o = torch.nn.Linear(self.hid_dim, self.hid_dim)
-        
-        self.dropout = torch.nn.Dropout(dropout)
-        
-        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(device)
-        
-    def forward(self, query, key, value, mask = None):
-        
-        batch_size = query.shape[0]
-        
-        #query = [batch size, query len, hid dim]
-        #key = [batch size, key len, hid dim]
-        #value = [batch size, value len, hid dim]
-               
-        Qbank = self.fc_q(query).view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
-        Kbank = self.fc_k(key).view(batch_size, -1, 1, self.head_dim).permute(0, 2, 3, 1)
-        Vbank = self.fc_v(value).view(batch_size, -1, 1, self.head_dim).permute(0, 2, 1, 3)   
-        
-        #Qbank = [batch size, n heads, query len, head dim]
-        #Kbank = [batch size, 1, head dim, key len]
-        #Vbank = [batch size, 1, value len, head dim]
-
-        energy = torch.matmul(Qbank, Kbank) / self.scale
-
-        #energy = [batch size, n heads, query len, key len]
-        
-        if mask is not None:
-            energy = energy.masked_fill(mask == 0, -1e10)
-        
-        attention = F.softmax(energy, dim = -1)
-                
-        #attention = [batch size, n heads, query len, key len]
-
-        x = torch.matmul(self.dropout(attention), Vbank)
-
-        x = x.permute(0, 2, 1, 3).contiguous()
-
-        x = x.view(batch_size, -1, self.hid_dim)
-        
-        #x = [batch size, seq len, hid dim]
-        
-        x = self.fc_o(x)
-        
-        return x, attention
 
 class RepresentNet_Trans(torch.nn.Module):
     def __init__(self, 
