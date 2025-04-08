@@ -253,17 +253,156 @@ class AlphaCirRepNet(nn.Module):
 
 
 
+###Prediction Network
+class ResBlockV2(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int = None):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim or dim
+
+        self.ln1 = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, self.hidden_dim)
+
+        self.ln2 = nn.LayerNorm(self.hidden_dim)
+        self.fc2 = nn.Linear(self.hidden_dim, dim)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.ln1(x)
+        out = F.relu(out)
+        out = self.fc1(out)
+
+        out = self.ln2(out)
+        out = F.relu(out)
+        out = self.fc2(out)
+
+        return out + residual
+
+def make_policy_head(embedding_dim: int, num_actions: int, num_ResBlock: int, hidden_dim: int):
+    layers = []
+    
+    for _ in range(num_ResBlock):
+        layers.append(ResBlockV2(embedding_dim, hidden_dim))
+    
+    layers.append(nn.LayerNorm(embedding_dim))   # 最后加一个 LayerNorm，防止输出失控
+    layers.append(nn.ReLU())                     # 非线性激活（可选）
+    layers.append(nn.Linear(embedding_dim, num_actions))  # 输出动作 logits
+    
+    return nn.Sequential(*layers)
+
+class DistributionSupport(nn.Module):
+    def __init__(self, value_max: float, num_bins: int):
+        self.value_max = value_max
+        self.num_bins = num_bins
+        self.value_min = -value_max
+        self.support = torch.linspace(self.value_min, self.value_max, num_bins)  # shape: (num_bins,)
+        self.delta = self.support[1] - self.support[0]  # bin 宽度
+        self.register_buffer("support", torch.linspace(self.value_min, self.value_max, num_bins))
+
+    def scalar_to_two_hot(self, scalar: torch.Tensor) -> torch.Tensor:
+        """
+        将标量值映射为 two-hot 分布形式
+        支持批量输入，scalar shape: (batch,)
+        返回 shape: (batch, num_bins)
+        """
+        scalar = scalar.clamp(self.value_min, self.value_max)
+        batch_size = scalar.shape[0]
+        
+        # 缩放到 bin 的 float 下标（不取整）
+        pos = (scalar - self.value_min) / self.delta
+        lower_idx = pos.floor().long()
+        upper_idx = lower_idx + 1
+
+        # 权重分配
+        upper_w = pos - lower_idx.float()
+        lower_w = 1.0 - upper_w
+
+        # 创建 zero 初始化的分布
+        dist = torch.zeros(batch_size, self.num_bins, device=scalar.device)
+
+        # 边界处理
+        upper_idx = upper_idx.clamp(0, self.num_bins - 1)
+        lower_idx = lower_idx.clamp(0, self.num_bins - 1)
+
+        # 填入概率（two-hot）
+        dist.scatter_(1, lower_idx.unsqueeze(1), lower_w.unsqueeze(1))
+        dist.scatter_(1, upper_idx.unsqueeze(1), upper_w.unsqueeze(1))
+
+        return dist
+
+    def mean(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        从 logits 中解码出期望值（支持批量）
+        logits shape: (batch, num_bins)
+        返回 shape: (batch,)
+        """
+        probs = F.softmax(logits, dim=-1)  # 转成概率分布
+        expected = torch.sum(probs * self.support.to(logits.device), dim=-1)
+        return expected
+
+class CategoricalHead(nn.Module):
+    def __init__(self, embedding_dim: int, support: DistributionSupport, num_ResBlock: int, hidden_dim: int):
+        super().__init__()
+        self.support = support
+        self.embedding_dim = embedding_dim
+        self.num_bins = support.num_bins
+
+        self.res_blocks = nn.ModuleList([ResBlockV2(embedding_dim, hidden_dim) for _ in range(num_ResBlock)])
+        self.fc_out = nn.Linear(embedding_dim, self.num_bins)
+
+    def forward(self, x):
+        for block in self.res_blocks:
+            x = block(x)
+
+        logits = self.fc_out(x)
+        mean = self.support.mean(logits)
+        return dict(logits=logits, mean=mean)
+    
+
 
 class AlphaCirPreNet(nn.Module):
-    pass
+
+    def __init__(
+        self,
+        task_spec,
+        value_max: float,
+        num_bins: int,
+        embedding_dim: int,
+        num_resblocks: int,
+        hidden_dim: int
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.support = DistributionSupport(value_max, num_bins)
+        self.num_bins = num_bins
+
+        # Heads
+        self.policy_head = make_policy_head(embedding_dim, task_spec.num_actions, num_resblocks, hidden_dim)
+        self.fidelity_value_head = CategoricalHead(embedding_dim, self.support, num_resblocks, hidden_dim)
+        self.length_value_head = CategoricalHead(embedding_dim, self.support, num_resblocks, hidden_dim)
+
+    def forward(self, embedding: torch.Tensor):
+        """
+        embedding: (batch_size, embedding_dim)
+        returns:
+            dict with logits and mean value
+        """
+        fidelity_value = self.fidelity_value_head(embedding)  # logits + mean
+        length_value = self.length_value_head(embedding)
+
+        total_value = fidelity_value["mean"] + length_value["mean"]
+        policy_logits = self.policy_head(embedding)
+
+        return {
+            "value": total_value,  # shape: (batch,)
+            "fidelity_value_logits": fidelity_value["logits"],  # shape: (batch, num_bins)
+            "length_value_logits": length_value["logits"],          # shape: (batch, num_bins)
+            "policy": policy_logits                                    # shape: (batch, num_actions)
+        }
 
 
-
-
-
-
-
-
+    
 
 #################################################################
 #####################  AlphaCirNetwork-End- #########################
