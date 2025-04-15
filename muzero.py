@@ -13,12 +13,37 @@ import ray
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from games.CirsysGame import *
 import diagnose_model
 import models
-import replay_buffer
-import self_play
-import shared_storage
-import trainer
+
+
+from shared_storage import SharedStorage
+from replay_buffer import ReplayBuffer
+from trainer import train_network
+from self_play import run_selfplay
+
+#################################################################
+########################### Main -Start- #######################
+
+
+def AlphaCir(config: AlphaCirConfig):
+  storage = SharedStorage()
+  replay_buffer = ReplayBuffer(config)
+
+  for _ in range(config.num_actors):
+    launch_job(run_selfplay, config, storage, replay_buffer)
+
+  train_network(config, storage, replay_buffer)
+
+  return storage.latest_network()
+
+
+def launch_job(f, *args):
+  f(*args)
+#################################################################
+########################### Main - End - #######################
+
 
 
 class MuZero:

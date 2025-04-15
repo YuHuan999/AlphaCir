@@ -3,6 +3,50 @@ import copy
 import ray
 import torch
 
+from models import AlphaCirNetwork, UniformNetwork
+#################################################################
+####################### Shared_Storage-Start- #######################
+def make_uniform_network(num_actions: int) -> UniformNetwork:
+    return UniformNetwork(num_actions)
+
+class SharedStorage(object):
+  """Controls which network is used at inference."""
+
+  def __init__(self, num_actions: int):
+    self._num_actions = num_actions
+    self._networks = {}
+
+  def latest_network(self) -> AlphaCirNetwork:
+    if self._networks:
+      return self._networks[max(self._networks.keys())]
+    else:
+      # policy -> uniform, value -> 0, reward -> 0
+      return make_uniform_network(self._num_actions)
+
+  def save_network(self, step: int, network: AlphaCirNetwork):
+    self._networks[step] = network
+
+
+
+
+#################################################################
+####################### Shared_Storage- End - #######################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @ray.remote
 class SharedStorage:

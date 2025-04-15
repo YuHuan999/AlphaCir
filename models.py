@@ -8,24 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Dict, NamedTuple
+from self_play import Action
 #################################################################
-#################### AlphaCirNetwork-Start- #####################
+#################### AlphaCirNetwork -Start- #####################
 
-###Network helpers
-class Action(object):
-  """Action representation."""
-
-  def __init__(self, index: int):
-    self.index = index
-
-  def __hash__(self):
-    return self.index
-
-  def __eq__(self, other):
-    return self.index == other.index
-
-  def __gt__(self, other):
-    return self.index > other.index
 
 class NetworkOutput(NamedTuple):
   value: np.ndarray
@@ -84,8 +70,8 @@ class UniformNetwork(nn.Module):
     def inference(self, observation: torch.Tensor) -> NetworkOutput:
         batch_size = observation.shape[0] if observation.ndim > 1 else 1
 
-        outputs = [ NetworkOutput(
-        value=np.zeros(self.num_actions),
+        outputs = [ NetworkOutput( ## tensor???
+        value=np.zeros(self.num_actions), 
         fiedlity_value_logits=np.zeros(self.num_actions),
         length_value_logits=np.zeros(self.num_actions),
         policy_logits={Action(a): 1.0 / self.num_actions for a in range(self.num_actions)}) 

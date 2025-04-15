@@ -1,12 +1,365 @@
 import math
 import time
 
-import numpy
+import numpy as np
 import ray
 import torch
 
 import models
 import copy
+
+from collections import namedtuple
+from typing import Optional, Sequence, Dict, NamedTuple, Any, Tuple, List
+
+import random
+
+from models import AlphaCirNetwork, NetworkOutput
+
+from games.CirsysGame import Game
+from games.CirsysGame import AlphaCirConfig
+
+from shared_storage import SharedStorage
+from replay_buffer import ReplayBuffer
+#################################################################
+####################### Self_play-Start- #######################
+
+MAXIMUM_FLOAT_VALUE = float('inf')
+
+KnownBounds = namedtuple('KnownBounds', ['min', 'max'])
+
+class Action(object):
+  """Action representation."""
+
+  def __init__(self, index: int):
+    self.index = index
+
+  def __hash__(self):
+    return self.index
+
+  def __eq__(self, other):
+    return self.index == other.index
+
+  def __gt__(self, other):
+    return self.index > other.index
+
+class MinMaxStats(object):
+  """A class that holds the min-max values of the tree."""
+
+  def __init__(self, known_bounds: Optional[KnownBounds]):
+    self.maximum = known_bounds.max if known_bounds else -MAXIMUM_FLOAT_VALUE
+    self.minimum = known_bounds.min if known_bounds else MAXIMUM_FLOAT_VALUE
+
+  def update(self, value: float):
+    self.maximum = max(self.maximum, value)
+    self.minimum = min(self.minimum, value)
+
+  def normalize(self, value: float) -> float:
+    if self.maximum > self.minimum:
+      # We normalize only when we have set the maximum and minimum values.
+      return (value - self.minimum) / (self.maximum - self.minimum)
+    return value
+
+class Player:
+    def __init__(self, player_id, player_type="self_play"):
+        self.player_id = player_id      # 例如 0 或 1
+        self.player_type = player_type  # "human" 或 "self_play"
+
+    def __repr__(self):
+        return f"Player({self.player_id}, type={self.player_type})"
+
+def softmax_sample(visit_counts: List[Tuple[int, Any]], temperature: float):
+    visits = np.array([v for v, _ in visit_counts], dtype=np.float32)
+    
+    if temperature == 0.0:
+        # 贪婪：选择访问次数最多的动作
+        max_visit = np.max(visits)
+        indices = np.where(visits == max_visit)[0]
+        selected = random.choice(indices)
+        return visit_counts[selected]
+    
+    # 否则按 softmax 分布采样
+    visits = visits ** (1 / temperature)  # 温度调整
+    probs = visits / np.sum(visits)      # softmax 概率
+    index = np.random.choice(len(visit_counts), p=probs)
+    return visit_counts[index]
+
+
+class ActionHistory(object):
+  """Simple history container used inside the search.
+
+  Only used to keep track of the actions executed.
+  """
+
+  def __init__(self, history: Sequence[Action], action_space_size: int):
+    self.history = list(history)
+    self.action_space_size = action_space_size
+
+  def clone(self):
+    return ActionHistory(self.history, self.action_space_size)
+
+  def add_action(self, action: Action):
+    self.history.append(action)
+
+  def last_action(self) -> Action:
+    return self.history[-1]
+
+  def action_space(self) -> Sequence[Action]:
+    return [Action(i) for i in range(self.action_space_size)]
+
+  def to_play(self) -> Player:
+    return Player()
+
+class Node(object):
+  """MCTS node."""
+
+  def __init__(self, prior: float):
+    self.visit_count = 0         # 当前节点被访问了多少次
+    self.to_play = -1            # 当前轮到哪个玩家（-1为默认值）
+    self.prior = prior           # 从策略网络中获得的先验概率
+    self.value_sum = 0           # 当前节点累积的 value 值
+    self.children = {}           # 子节点，结构为 action -> Node
+    self.hidden_state = None     # 用于存储模型隐状态（在 MuZero 中很关键）
+    self.reward = 0              # 当前节点上的即时奖励
+
+  def expanded(self) -> bool:
+    return bool(self.children)
+
+  def value(self) -> float:
+    if self.visit_count == 0:
+      return 0
+    return self.value_sum / self.visit_count
+  
+  def __repr__(self):
+    return (
+        f"Node("
+        f"prior={self.prior:.4f}, "
+        f"visits={self.visit_count}, "
+        f"value={self.value():.4f}, "
+        f"value_sum={self.value_sum:.4f}, "
+        f"reward={self.reward:.4f}, "
+        f"num_children={len(self.children)}"
+        f")"
+    )
+
+# Each self-play job is independent of all others; it takes the latest network
+# snapshot, produces a game and makes it available to the training job by
+# writing it to a shared replay buffer.
+def run_selfplay(
+    config: AlphaCirConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
+):
+  while True:
+    network = storage.latest_network()
+    game = play_game(config, network)
+    replay_buffer.save_game(game)
+
+
+def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
+  """Plays an AlphaCir game.
+
+  Each game is produced by starting at the initial empty program, then
+  repeatedly executing a Monte Carlo Tree Search to generate moves until the end
+  of the game is reached.
+
+  Args:
+    config: An instance of the AlphaDev configuration.
+    network: Networks used for inference.
+
+  Returns:
+    The played game.
+  """
+
+  game = Game(config.task_spec) 
+
+  while not game.terminal() and len(game.history) < config.max_moves:
+    min_max_stats = MinMaxStats(config.known_bounds)
+
+    # Initialisation of the root node and addition of exploration noise
+    root = Node(0)
+    current_observation = game.make_observation(-1)
+    network_output = network.inference(current_observation)
+    _expand_node(
+        root, game.to_play(), game.legal_actions(), network_output, reward=0
+    )
+    _backpropagate(
+        [root],
+        network_output.value,
+        game.to_play(),
+        config.discount,
+        min_max_stats,
+    )
+    _add_exploration_noise(config, root)
+
+    # We then run a Monte Carlo Tree Search using the environment.
+    run_mcts(
+        config,
+        root,
+        game.action_history(),
+        network,
+        min_max_stats,
+        game,
+    )
+    action = _select_action(config, len(game.history), root, network)
+    game.apply(action)
+    game.store_search_statistics(root)
+  return game
+
+
+def run_mcts(
+    config: AlphaCirConfig,
+    root: Node,
+    action_history: ActionHistory,
+    network: AlphaCirNetwork,
+    min_max_stats: MinMaxStats,
+    env: Game,
+):
+  """Runs the Monte Carlo Tree Search algorithm.
+
+  To decide on an action, we run N simulations, always starting at the root of
+  the search tree and traversing the tree according to the UCB formula until we
+  reach a leaf node.
+
+  Args:
+    config: AlphaDev configuration
+    root: The root node of the MCTS tree from which we start the algorithm
+    action_history: history of the actions taken so far.
+    network: instances of the networks that will be used.
+    min_max_stats: min-max statistics for the tree.
+    env: an instance of the AssemblyGame.
+  """
+
+  for _ in range(config.num_simulations):
+    history = action_history.clone()
+    node = root
+    search_path = [node]
+    sim_env = env.clone()
+
+    while node.expanded():
+      action, node = _select_child(config, node, min_max_stats)
+      sim_env.step(action)
+      history.add_action(action)
+      search_path.append(node)
+
+    # Inside the search tree we use the environment to obtain the next
+    # observation and reward given an action.
+    observation, reward = sim_env.step(action)
+    network_output = network.inference(observation)
+    _expand_node(
+        node, history.to_play(), history.action_space(), network_output, reward
+    )
+
+    _backpropagate(
+        search_path,
+        network_output.value,
+        history.to_play(),
+        config.discount,
+        min_max_stats,
+    )
+
+
+def _select_action(
+    # pylint: disable-next=unused-argument
+    config: AlphaCirConfig, num_moves: int, node: Node, network: AlphaCirNetwork
+):
+  visit_counts = [
+      (child.visit_count, action) for action, child in node.children.items()
+  ]
+  t = config.visit_softmax_temperature_fn(
+      training_steps=network.training_steps()
+  )
+  _, action = softmax_sample(visit_counts, t)
+  return action
+
+
+def _select_child(
+    config: AlphaCirConfig, node: Node, min_max_stats: MinMaxStats
+):
+  """Selects the child with the highest UCB score."""
+  _, action, child = max(
+      (_ucb_score(config, node, child, min_max_stats), action, child)
+      for action, child in node.children.items()
+  )
+  return action, child
+
+
+def _ucb_score(
+    config: AlphaCirConfig,
+    parent: Node,
+    child: Node,
+    min_max_stats: MinMaxStats,
+) -> float:
+  """Computes the UCB score based on its value + exploration based on prior."""
+  pb_c = (
+      math.log((parent.visit_count + config.pb_c_base + 1) / config.pb_c_base)
+      + config.pb_c_init
+  )
+  pb_c *= math.sqrt(parent.visit_count) / (child.visit_count + 1)
+
+  prior_score = pb_c * child.prior
+  if child.visit_count > 0:
+    value_score = min_max_stats.normalize(
+        child.reward + config.discount * child.value()
+    )
+  else:
+    value_score = 0
+  return prior_score + value_score
+
+
+def _expand_node(
+    node: Node,
+    to_play: Player,
+    actions: Sequence[Action],
+    network_output: NetworkOutput,
+    reward: float,
+):
+  """Expands the node using value, reward and policy predictions from the NN."""
+  node.to_play = to_play
+  node.hidden_state = network_output.hidden_state
+  node.reward = reward
+  policy = {a: math.exp(network_output.policy_logits[a]) for a in actions}
+  policy_sum = sum(policy.values())
+  for action, p in policy.items():
+    node.children[action] = Node(p / policy_sum)
+
+
+def _backpropagate(
+    search_path: Sequence[Node],
+    value: float,
+    to_play: Player,
+    discount: float,
+    min_max_stats: MinMaxStats,
+):
+  """Propagates the evaluation all the way up the tree to the root."""
+  for node in reversed(search_path):
+    node.value_sum += value if node.to_play == to_play else -value
+    node.visit_count += 1
+    min_max_stats.update(node.value())
+
+    value = node.reward + discount * value
+
+
+def _add_exploration_noise(config: AlphaCirConfig, node: Node):
+  """Adds dirichlet noise to the prior of the root to encourage exploration."""
+  actions = list(node.children.keys())
+  noise = np.random.dirichlet([config.root_dirichlet_alpha] * len(actions))
+  frac = config.root_exploration_fraction
+  for a, n in zip(actions, noise):
+    node.children[a].prior = node.children[a].prior * (1 - frac) + n * frac
+
+
+
+
+#################################################################
+####################### Self_play- End - #######################
+
+
+
+
+
+
+
+
+
+
 
 @ray.remote
 class SelfPlay:

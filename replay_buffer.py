@@ -6,6 +6,58 @@ import ray
 import torch
 
 import models
+from typing import Optional, Sequence, Dict, NamedTuple
+
+from games.CirsysGame import Game
+from games.CirsysGame import AlphaCirConfig
+from self_play import Sample
+
+
+#################################################################
+####################### Replay_Buffer-Start- #######################
+class ReplayBuffer(object):
+  """Replay buffer object storing games for training."""
+
+  def __init__(self, config: AlphaCirConfig):
+    self.window_size = config.window_size #最多存多少局游戏（FIFO）
+    self.batch_size = config.batch_size #每次训练采样多少个训练样本
+    self.buffer = [] #保存所有游戏的列表，每一项是一个完整 Game 实例
+
+  def save_game(self, game):
+    if len(self.buffer) > self.window_size:
+      self.buffer.pop(0)
+    self.buffer.append(game)
+
+  def sample_batch(self, td_steps: int) -> Sequence[Sample]:
+    games = [self.sample_game() for _ in range(self.batch_size)]
+    game_pos = [(g, self.sample_position(g)) for g in games]
+    # pylint: disable=g-complex-comprehension
+    return [
+        Sample(
+            observation=g.make_observation(i), ## observation该包括什么呢？
+            bootstrap_observation=g.make_observation(i + td_steps), ## observation该包括什么呢？
+            target=g.make_target(i, td_steps, g.to_play()),
+        )
+        for (g, i) in game_pos
+    ]
+    # pylint: enable=g-complex-comprehension
+
+  def sample_game(self) -> Game:
+    # Sample game from buffer either uniformly or according to some priority.
+    return self.buffer[0]
+
+  # pylint: disable-next=unused-argument
+  def sample_position(self, game) -> int:
+    # Sample position from game either uniformly or according to some priority.
+    return -1
+
+
+
+
+
+
+#################################################################
+####################### Replay_Buffer- End - #######################
 
 
 @ray.remote

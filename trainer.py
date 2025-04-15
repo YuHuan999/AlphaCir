@@ -3,9 +3,119 @@ import time
 
 import numpy
 import ray
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import models
+from models import AlphaCirNetwork, NetworkOutput
+
+from games.CirsysGame import Game
+from games.CirsysGame import AlphaCirConfig
+
+from shared_storage import SharedStorage
+from replay_buffer import ReplayBuffer
+
+from typing import Any, Sequence
+from collections import namedtuple
+#################################################################
+######################## Trainer -Start- #######################
+
+
+
+def train_network(config, storage, replay_buffer):
+    """Trains the network on data stored in the replay buffer."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    network = AlphaCirNetwork(config.hparams_r, config.hparams_p, config.task_spec).to(device)
+    target_network = AlphaCirNetwork(config.hparams_r, config.hparams_p, config.task_spec).to(device)
+    target_network.load_state_dict(network.state_dict())  # 初始化目标网络
+
+    optimizer = torch.optim.SGD(network.parameters(), lr=config.lr_init, momentum=config.momentum)
+
+    for i in range(config.training_steps):
+        if i % config.checkpoint_interval == 0:
+            storage.save_network(i, network)
+
+        if i % config.target_network_interval == 0:
+            target_network.load_state_dict(network.state_dict())
+
+        batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
+        optimizer.zero_grad()
+        loss = compute_loss(network, target_network, batch, device)
+        loss.backward()
+        optimizer.step()
+
+    storage.save_network(config.training_steps, network)
+
+
+def compute_loss(network, target_network, batch, device):
+    total_loss = 0.0
+
+    for observation, bootstrap_obs, target in batch:
+        # Move tensors to device
+        observation = move_to_device(observation, device)
+        bootstrap_obs = move_to_device(bootstrap_obs, device)
+        target_fidelity, target_length, target_policy, bootstrap_discount = target
+
+        # Forward pass
+        predictions = network(observation)
+        bootstrap_predictions = target_network(bootstrap_obs)
+
+        # Unpack predictions
+        policy_logits = predictions["policy"]
+        fidelity_logits = predictions["fidelity_value_logits"]
+        length_logits = predictions["length_value_logits"]
+
+        # Target for value（加上 TD bootstrapping）
+        bootstrap_target = bootstrap_predictions["fidelity_value_logits"].detach()
+        # target_fidelity = reward[1] + γ * reward[2] + γ² * reward[3] + γ³ * V(s_4)
+        target_fidelity += bootstrap_discount * bootstrap_target
+        
+        policy_loss = F.cross_entropy(policy_logits, target_policy)
+        fidelity_loss = scalar_loss(fidelity_logits, target_fidelity, network)
+        length_loss = scalar_loss(length_logits, target_length, network)
+
+        total_loss += policy_loss + fidelity_loss + length_loss
+
+    return total_loss / len(batch)
+
+def scalar_loss(pred_logits, scalar_target, network):
+    """
+    pred_logits: shape (B, num_bins)
+    scalar_target: shape (B,)
+    """
+    two_hot_target = network.prediction.support.scalar_to_two_hot(scalar_target)
+    log_probs = F.log_softmax(pred_logits, dim=-1)
+    loss = -(two_hot_target * log_probs).sum(dim=-1).mean()
+    return loss
+
+def move_to_device(data, device):
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    elif isinstance(data, dict):
+        return {k: move_to_device(v, device) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [move_to_device(x, device) for x in data]
+    else:
+        return data
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################################################################
+######################## Trainer - End - #######################
+
 
 
 @ray.remote
