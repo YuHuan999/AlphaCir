@@ -1,7 +1,20 @@
-import datetime
-import pathlib
+import glob
+import re
+import pickle
+import os
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["PYTORCH_JIT_LOG_LEVEL"] = ">>"
+
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+## 线程和多进程
+import threading
+from multiprocessing import Process, Lock, Queue, Manager, current_process
+from multiprocessing.queues import Empty as mp_Empty
+from typing import Sequence
+import queue
+import time
 
 import math
 import copy
@@ -27,6 +40,11 @@ from games.abstract_game import AbstractGame # for local test
 import pdb
 # Test model
 from global_config import test_model, test_model_run
+recorder_fid = SummaryWriter(log_dir="records/fidelities")  # 可自定义路径
+recorder_loss = SummaryWriter(log_dir="records/losses")  # 可自定义路径
+recorder_params = SummaryWriter(log_dir="records/params")  # 可自定义路径
+GATES2Index = {"H": 0, "S": 1, "T": 2, "S†": 3, "T†": 4, "CX": 5}
+Index2GATES = {0:"H", 1:"S", 2:"T", 3: "S†", 4: "T†", 5:"CX"}
 #################################################################
 ######################### Tools -Start- #######################
 
@@ -54,14 +72,17 @@ class Node(object):
     #   print("value_sum", self.value_sum, type(self.value_sum))
     return self.value_sum / self.visit_count
   
-  def __repr__(self):
+def __repr__(self):
+    def safe_float(x):
+        return x.item() if isinstance(x, torch.Tensor) else x
+
     return (
         f"Node("
-        f"prior={self.prior:.4f}, "
+        f"prior={safe_float(self.prior):.4f}, "
         f"visits={self.visit_count}, "
-        f"value={self.value():.4f}, "
-        f"value_sum={self.value_sum:.4f}, "
-        f"reward={self.reward:.4f}, "
+        f"value={safe_float(self.value()):.4f}, "
+        f"value_sum={safe_float(self.value_sum):.4f}, "
+        f"reward={safe_float(self.reward):.4f}, "
         f"num_children={len(self.children)}"
         f")"
     )
@@ -74,7 +95,7 @@ class Player:
     def __repr__(self):
         return f"Player({self.player_id}, type={self.player_type})"
 
-GATES = {"H": 0, "S": 1, "T": 2, "S†": 3, "T†": 4}
+
 
 def index2action(index: int, num_qubits: int, num_actions: int):
     """
@@ -95,26 +116,47 @@ def action2index(action, num_qubits: int, num_actions: int) -> int:
     gate, location, control = action
     num_actions_per_qubit = num_actions // num_qubits
     if gate != "CX":
-        ope = GATES[gate]
+        ope = GATES2Index[gate]
     else:
         op = control if control < location else control - 1
         ope = 5 + op
     return location * num_actions_per_qubit + ope
 
-class Action(object):
-  """Action representation."""
+# class Action(object):
+#   """Action representation."""
 
-  def __init__(self, index: int):
-    self.index = index
+#   def __init__(self, index: int):
+#     self.index = index
 
-  def __hash__(self):
-    return self.index
+#   def __hash__(self):
+#     return self.index
 
-  def __eq__(self, other):
-    return self.index == other.index
+#   def __eq__(self, other):
+#     return self.index == other.index
 
-  def __gt__(self, other):
-    return self.index > other.index
+#   def __gt__(self, other):
+#     return self.index > other.index
+
+class Action:
+    def __init__(self, index: int):
+        self.index = index
+
+    def __hash__(self):
+        return hash(self.index)
+
+    def __eq__(self, other):
+        return isinstance(other, Action) and self.index == other.index
+
+    def __repr__(self):
+        return f"Action({self.index})"
+
+    def __getstate__(self):
+        return self.index
+
+    def __setstate__(self, state):
+        self.index = state
+
+
 
 class ActionHistory(object):
   """Simple history container used inside the search.
@@ -127,12 +169,12 @@ class ActionHistory(object):
     self.action_space_size = action_space_size
 
   def clone(self):
-    return copy.deepcopy(ActionHistory(self.history, self.size))
+    return copy.deepcopy(ActionHistory(self.history, self.action_space_size))
 
   def add_action(self, action: Action):
     self.history.append(action.index)
 
-  def last_action(self) -> Action:
+  def last_action(self): 
     return self.history[-1]
   ## action space 给出的是 Action list
   def action_space(self) -> Sequence[Action]:
@@ -143,23 +185,105 @@ class ActionHistory(object):
 
 
 def soft_cross_entropy(logits, target_probs):
+    
     log_probs = F.log_softmax(logits, dim=-1)
+    # print("log_probs", log_probs, type(log_probs))
     return -(target_probs * log_probs).sum(dim=-1).mean()
 
+## 并行化处理
+def collate_batch(batch: List[Dict[str, Any]], max_length) -> Dict[str, Any]:
+    # if test_model:
+    #     print("test model collate_batch", batch)
+    #     for item in batch:
+    #         print("test model circuit", item["circuit"])
+    
+    # pad_token = np.full((3,), -1)
+    circuits = []
+    circuits_length = []
+    matrices = []
+    for idx in range(len(batch)):
+        circuit = batch[idx]["circuit"]
+        circuit_length = batch[idx]["circuit_length"]
+        d2 = max_length - len(circuit) 
+        pad_token = np.full((d2, 3), -1)
+        # print("circuit", circuit, type(circuit))
+    #    print("gate", type(circuit[0]))
 
-def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if test_model:
-        print("test model collate_batch", batch)
-        for item in batch:
-            print("test model circuit", item["circuit"])
-        
+        if circuit.size == 0:
+            padded = pad_token
+        else:
+            padded = np.concatenate([circuit, pad_token], axis=0)
+           
+        circuits.append(padded)
+        circuits_length.append(circuit_length)
+        matrices.append(torch.tensor(batch[idx]["matrix"], dtype=torch.complex64))  # ✅ 保留复数
 
+    circuits_np = np.array(circuits)  # 自动转换成统一形状的 np.ndarray
+    circuits = torch.from_numpy(circuits_np).to(dtype=torch.long)
 
     return {
-        "circuits": torch.stack([torch.tensor(obs["circuit"]) for obs in batch], dim=0),
-        "circuits_length": torch.tensor([obs["circuit_length"] for obs in batch], dtype=torch.long),
-        "matrices": torch.stack([torch.tensor(obs["matrix"]) for obs in batch])
+        "circuits": circuits,
+        "circuits_length": torch.tensor(circuits_length, dtype=torch.long),
+        "matrices": torch.stack(matrices),
     }
+
+def move_to_device(data, device):
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    elif isinstance(data, dict):
+        return {k: move_to_device(v, device) for k, v in data.items()}
+    elif isinstance(data, (list, tuple)):
+        return [move_to_device(x, device) for x in data]
+    else:
+        return data
+    
+def move_to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    elif isinstance(obj, dict):
+        return {k: move_to_cpu(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [move_to_cpu(v) for v in obj]
+    elif hasattr(obj, '__dict__'):
+        for k, v in vars(obj).items():
+            setattr(obj, k, move_to_cpu(v))
+        return obj
+    else:
+        return obj
+    
+def save_game_to_file(game, filename="games.pkl", folder="saved_games"):
+    # print("save_game_to_file", filename, folder)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
+    with open(path, "wb") as f:
+        pickle.dump(game, f) 
+    # print(f"游戏已保存至 {filename}")   
+
+# def load_games(filename="games.pkl", folder="saved_games"):
+#     path = os.path.join(folder, filename)
+#     if os.path.exists(path):
+#         with open(path, "rb") as f:
+#             games = pickle.load(f)
+#         return games
+#     else:
+#         print("No saved games now, initialization.")
+#         return []
+    
+def save_network_to_file(network, filename="network_dump.pkl", folder="saved_networks"):
+   pass
+
+def networks_equal(net1: nn.Module, net2: nn.Module) -> bool:
+    state_dict1 = net1.state_dict()
+    state_dict2 = net2.state_dict()
+
+    if state_dict1.keys() != state_dict2.keys():
+        return False
+
+    for key in state_dict1:
+        if not torch.equal(state_dict1[key], state_dict2[key]):
+            return False
+
+    return True
 
 
 #################################################################
@@ -214,13 +338,13 @@ class AlphaCirConfig(object):
       self,
   ):
     ### Self-Play
-    self.num_actors = 128  # TPU actors
+    self.num_actors = 4  # num of actors
     # pylint: disable-next=g-long-lambda
-    self.visit_softmax_temperature_fn = lambda steps: (
-        1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
-    )
-    self.max_moves = 10   ## 10 for test
-    self.num_simulations = 80 ## 80 for test
+    # self.visit_softmax_temperature_fn = lambda steps: (
+    #     1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
+    # )
+    self.max_moves = 20 ## 10 for test
+    self.num_simulations = 100 ## 80 for test
     self.discount = 1.0
 
     # Root prior exploration noise.
@@ -235,7 +359,7 @@ class AlphaCirConfig(object):
 
     # Environment: spec of the Variable Sort 3 task
     self.task_spec = TaskSpec.create(
-        max_circuit_length=50,  # 50
+        max_circuit_length = self.max_moves,  # 50
         num_qubits=2,
         num_ops=6,  # type of all gates H S T S† T† CX
         fidelity_reward=1.0,
@@ -248,14 +372,14 @@ class AlphaCirConfig(object):
 
     ### Network architecture
     self.hparams = ml_collections.ConfigDict()
-    self.hparams.embedding_dim = 512
+    self.hparams.embedding_dim = 128
     self.hparams.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     self.hparams.representation = ml_collections.ConfigDict()
     self.hparams.representation.input_dim = 10 # 输入维度，通常是门的 one-hot 编码长度
     self.hparams.representation.head_depth = 128
     self.hparams.representation.num_heads = 4
-    self.hparams.representation.dropout = 0.1
-    self.hparams.representation.num_mqa_blocks = 6
+    self.hparams.representation.dropout = 0.2
+    self.hparams.representation.num_mqa_blocks = 1 ## 1 for test
     
     # self.hparams.representation.attention.position_encoding = 'absolute'
     # self.hparams.representation.repr_net_res_blocks = 8
@@ -266,24 +390,26 @@ class AlphaCirConfig(object):
     # self.hparams.representation.use_permutation_embedding = False
 
     self.hparams.prediction = ml_collections.ConfigDict()
-    self.hparams.prediction.value_max = 3.0  # These two parameters are task / reward-
+    self.hparams.prediction.value_max = 10.0  # These two parameters are task / reward-
     self.hparams.prediction.num_bins = 51  # dependent and need to be adjusted.
-    self.hparams.prediction.num_resblocks = 1  # dependent and need to be adjusted.
-    self.hparams.prediction.hidden_dim = 512  # hidden_dim of the prediction network
-    
+    self.hparams.prediction.num_resblocks = 2  # dependent and need to be adjusted.
+    self.hparams.prediction.hidden_dim = 128  # hidden_dim of the prediction network
+
     ### Training
-    self.training_steps = int(1000e3)
-    self.checkpoint_interval = 500
-    self.target_network_interval = 100
+    self.max_training_steps = 1000# for test
+    self.checkpoint_interval = 100 ## for test
+    self.target_network_interval = 200
     self.window_size = int(1e6)
-    self.batch_size = 8 ## 8 for test 
+    self.batch_size = 16 ## 8 for test 
     self.td_steps = 5
-    self.lr_init = 2e-4
+    self.lr_init = 1e-4 ## 1e-3 for test
     self.momentum = 0.9
 
     # Build action maps
     self._build_action_maps()
-
+  
+  def visit_softmax_temperature_fn(self, steps):
+    return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
 
   def new_game(self):
     return Game(self.task_spec)
@@ -315,6 +441,8 @@ class AlphaCirConfig(object):
 
     def get_index_from_action(self, action: list):
         return self.action2index_map[tuple(action)]
+    
+
 
 #################################################################
 ######################## Configs - End - ######################
@@ -385,7 +513,7 @@ class Game(AbstractGame):
         self.QFT = qlib.QFT(self.task_spec.num_qubits)
         self.QFT_matrix = Operator(self.QFT).data
         self.pre_fidelity = 0.0
-        self.player = None
+        self.player = 0
         self.qc = QuantumCircuit(self.task_spec.num_qubits)
         self.is_terminal = False
         self.discount = task_spec.discount
@@ -396,8 +524,10 @@ class Game(AbstractGame):
         self.rewards = []
         self.fidelity_rewards = []
         self.length_rewards = []
-        self.history = [] ##list of gate index  
-        self.child_visits = []
+        self.history = [] ## list of gate index
+        self.history_Instruction = [] ## list of instructions could be implemented ["CX", 1, 0]
+        self.history_numed = [] ## [gate_type_index, control bit, target bit] [2, 0, 0]
+        self.child_visits = [] 
         self.root_values = []
 
 
@@ -411,9 +541,14 @@ class Game(AbstractGame):
         """
         # is_terminal = False
         action_index = action2index(action, self.task_spec.num_qubits, self.task_spec.num_actions)
-        print(" self.history 前",  self.history)
-        self.history.append(action_index)
-        print(" self.history 后",  self.history)
+        # print(" self.history 前",  self.history)
+        self.history.append(action_index)   ##list of gate index
+        # print(" self.history 后",  self.history)
+        action_numed = copy.deepcopy(action)
+        action_numed[0] = GATES2Index[action_numed[0]]
+        self.history_numed.append(action_numed)  ## for collate batch [gate_type_index, control bit, target bit] [2, 0, 0]
+
+        self.history_Instruction.append(action)  
         gate, location, control = action
         if gate == "CX":
             self.circuit[location].append(action)
@@ -438,7 +573,7 @@ class Game(AbstractGame):
         matrix_in = Operator(self.qc).data
         assert (matrix_in == matrix).all()
 
-        d = matrix.shape[0]
+        d = matrix.shape[0]  
 
         hs_inner = cirq.hilbert_schmidt_inner_product(matrix, self.QFT_matrix)
         fidelity = np.abs(hs_inner) / d
@@ -460,9 +595,33 @@ class Game(AbstractGame):
         return self.render(), reward, fidelity_reward, length_reward, self.is_terminal
     
     def store_search_statistics(self, root: Node):
-        sum_visits = sum(child.visit_count for child in root.children.values())
+        # print("root in store_search_statistics", root.children)
+
+        # print("root.children", root.children)
+        # for child in root.children:
+        #     print("child", child)
+
+        
+        
+        sum_visits = 0
+        for child in root.children.values():
+            # print("child", child)
+            sum_visits += child.visit_count
+            # print("child visit count", child.visit_count)
+
+        # print("sum_visits", sum_visits)
+
         ## list of all Actions
         action_space = self.action_history().action_space() 
+
+        # for a in action_space:
+        #     visit_count = root.children[a].visit_count 
+        #     print("visit count", visit_count)
+        #     self.child_visits.append
+
+
+        #     print("node children", isinstance(root.children[a], Node))
+                
         self.child_visits.append(
             [
                 root.children[a].visit_count / sum_visits
@@ -651,18 +810,61 @@ class Game(AbstractGame):
 
     ## render 获取的数据可能不够？？？
     def render(self):
+        try:
+            mat = Operator(self.simulator.qc).data
+        except Exception as e:
+            print("Operator 生成失败！当前电路指令：")
+            print(self.simulator.qc)
+            raise e  # 继续抛出错误，帮助你调试
+        mat_cpu = np.array(mat)  # 确保是 numpy.ndarray 且在 CPU
+        circuit_length_cpu = int(self.simulator.length_qc)  # 转为 python int
+        circuit_cpu = np.array(self.history_numed, dtype=np.int32)
+        # print("self.fidelities", self.fidelities)
+        fidelity = float(self.fidelities[-1])
+        f_reward = float(self.fidelity_rewards[-1])
+        l_reward = float(self.length_rewards[-1])
+        player = int(self.player)
+        discount = float(self.discount)
+        child_visits = np.array(self.child_visits[-1], dtype=np.float32) if self.child_visits else None
+
         return {
-            'matrix': Operator(self.simulator.qc).data,
-            'circuit_length': self.simulator.length_qc,
-            'circuit': self.history
+            'matrix': mat_cpu,
+            'circuit_length': circuit_length_cpu,
+            'circuit': circuit_cpu,
+            'fidelity': fidelity,
+            "f_reward":f_reward,
+            "l_reward":l_reward,
+            "player": player,
+            "discount": discount,
+            "child_visits": child_visits,
+        }
+    def render_ob(self):
+        try:
+            mat = Operator(self.simulator.qc).data
+        except Exception as e:
+            print("Operator 生成失败！当前电路指令：")
+            print(self.simulator.qc)
+            raise e  # 继续抛出错误，帮助你调试
+        mat_cpu = np.array(mat)  # 确保是 numpy.ndarray 且在 CPU
+        circuit_length_cpu = int(self.simulator.length_qc)  # 转为 python int
+        circuit_cpu = np.array(self.history_numed, dtype=np.int32)
+        if self.fidelities:
+            fidelity = self.fidelities[-1]
+        else:
+            fidelity = 0.0
+        return {
+            'matrix': mat_cpu,
+            'circuit_length': circuit_length_cpu,
+            'circuit': circuit_cpu,
+            'fidelity': fidelity,
         }
     def make_observation(self, state_index: int):
         if state_index == -1:
-            return self.render()
+            return self.render_ob()
         env = self.reset()
-        for action in self.history[:state_index]:
+        for action in self.history_Instruction[:state_index]:
             env.step(action)
-            observation = env.render()
+        observation = env.render()
         return observation
     ## 可能有问题，取出来的数据可能不足
     def make_target(
@@ -672,7 +874,9 @@ class Game(AbstractGame):
     # The value target is the discounted sum of all rewards until N steps
     # into the future, to which we will add the discounted boostrapped future
     # value.
-    
+        f_rewards = 0.0
+        l_rewards = 0.0
+
         bootstrap_index = state_index + td_steps
 
         for i, (f_reward, l_reward) in enumerate(zip(
@@ -689,7 +893,8 @@ class Game(AbstractGame):
         return Target(
             f_rewards,
             l_rewards,
-            self.child_visits[state_index],
+            torch.tensor(self.child_visits[state_index], dtype=torch.float32),
+            # self.child_visits[state_index],
             bootstrap_discount,
         )
 
@@ -735,7 +940,7 @@ class NetworkOutput(NamedTuple):
   value: np.ndarray
   fidelity_value_logits: np.ndarray
   length_value_logits: np.ndarray  ## 代表执行动作后余下的电路长短
-  policy_logits: Dict[Action, float] 
+  policy_logits: torch.Tensor 
   hidden_state: Optional[np.ndarray] = None
 
 
@@ -753,12 +958,30 @@ class AlphaCirNetwork(nn.Module):
             num_resblocks=hparams.prediction.num_resblocks,
             hidden_dim=hparams.prediction.hidden_dim,
         ).to(hparams.device)
+
+        self.training_steps = 0  # 训练步数
+
+
+
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+
+
     def forward(self, observation):
         embedding = self.representation(observation)
         return self.prediction(embedding)
     
     def inference(self, observation):
-        ## 参考uniform network infernence function
         self.eval()
         with torch.no_grad():
             embedding = self.representation.inference(observation)
@@ -778,10 +1001,10 @@ class AlphaCirNetwork(nn.Module):
 
 
     def training_steps(self):
-        pass  
+        return self.training_steps  # 训练步数
 
 
-class UniformNetwork(nn.Module):    
+class UniformNetwork(nn.Module):       ## 输出有问题！！！ 
     
     """
     UniformNetwork: 测试pipeline, 始终返回固定输出。
@@ -790,6 +1013,7 @@ class UniformNetwork(nn.Module):
         super().__init__()  # 正确初始化 nn.Module
         self.num_actions = num_actions
         self.params = {}
+        self.training_steps = 0  # 训练步数
 
     def forward(self, observation: torch.Tensor) -> NetworkOutput:
         batch_size = observation.shape[0] if observation.ndim > 1 else 1
@@ -798,21 +1022,21 @@ class UniformNetwork(nn.Module):
             value=np.zeros(self.num_actions), 
             fiedlity_value_logits=np.zeros(self.num_actions),
             length_value_logits=np.zeros(self.num_actions),
-            policy_logits={Action(a): 1.0 / self.num_actions for a in range(self.num_actions)}
+            policy_logits = torch.full((self.num_actions,), fill_value=1.0 / self.num_actions),  # shape: (num_actions,)
         ) for _ in range(batch_size)]
 
         return outputs
     
-    def inference(self, observation: torch.Tensor) -> NetworkOutput:
+    def inference(self, observation: torch.Tensor): 
         self.eval()
 
-        return {
-            "value": float(0), 
-            "fiedlity_value_logits": float(0),
-            "length_value_logits" : float(0),
-            "policy_logits":{Action(a): 1.0 / self.num_actions for a in range(self.num_actions)},
-            "hidden_state": None    
-        }
+        return NetworkOutput(
+            value = float(0),  # shape: (batch,)
+            fidelity_value_logits = float(0),  # shape: (batch, num_bins)
+            length_value_logits = float(0),          # shape: (batch, num_bins)
+            policy_logits = torch.full((self.num_actions,), fill_value=1.0 / self.num_actions),  # shape: (num_actions,)
+        )
+
     
     def get_params(self):
         return self.params
@@ -821,6 +1045,7 @@ class UniformNetwork(nn.Module):
         self.params = updates
 
     def training_steps(self) -> int:
+        ## 训练增加 
         return 0  # 不训练
 
 
@@ -1004,15 +1229,17 @@ class AlphaCirRepNet(nn.Module):
 
         # circuits = torch.as_tensor(inputs["circuits"], device=self.device) # 电路数据
         # circuits_length = torch.as_tensor(inputs["circuits_length"], device=self.device)  # 程序长度
-        print("print circuits", circuits)  # [batch_size, max_length_circuit, 3]
+        # print("print circuits", circuits)  # [batch_size, max_length_circuit, 3]
         
         batch_size = circuits.shape[0]  # 批大小
         max_length_circuit = self.max_circuit_length  # 最大电路长度
+        # if test_model:
+        #    print("test model circuits", circuits.shape)  
         if circuits.shape[1] == 0:
             # 空电路处理：返回全零嵌入或 learnable 的默认嵌入
             return torch.zeros((batch_size, self.embedding_dim), device=self.device)
         else:
-            batch_size, seq_len = circuits.shape  # 添加 input_dim 解包
+            batch_size, seq_len, _ = circuits.shape  # 添加 input_dim 解包
 
         circuits_onehot = self.circuits2onehot(circuits, batch_size, max_length_circuit).to(self.device)  # 将电路转换为 one-hot 编码
         # print(f"circuits_onehot: {circuits_onehot.shape}")  # [batch_size, max_length_circuit, input_dim]
@@ -1023,8 +1250,11 @@ class AlphaCirRepNet(nn.Module):
         embedded_mlp = self.mlp_embedder(circuits_onehot.view(-1, self.input_dim)).view(batch_size, seq_len, -1)
         _, seq_size, feat_size = embedded_mlp.shape
 
-        pos_enc = self.get_position_encoding(seq_size, feat_size, embedded_mlp.device)  ## take care of device
-        embedded = embedded_mlp + pos_enc.unsqueeze(0) 
+        # pos_enc = self.get_position_encoding(seq_size, feat_size, embedded_mlp.device)  ## take care of device
+        # embedded = embedded_mlp + pos_enc.unsqueeze(0)
+        # 获取 sinusoidal 位置编码，支持 mask 掉 padding 部分。
+        pos_enc = self.get_position_encoding_with_mask(seq_size, feat_size, embedded_mlp.device, circuits_length) 
+        embedded = embedded_mlp + pos_enc  # 加入位置编码
 
         for i in range(self.num_mqa_blocks):
             embedded, _ = self.mqas_embedder[i](embedded, embedded, embedded)
@@ -1043,36 +1273,53 @@ class AlphaCirRepNet(nn.Module):
         ##     'circuit': self.history }   
         self.eval()
         with torch.no_grad():
+            # print("input", input)
 
             input = [input] 
-            observation = move_to_device(collate_batch(input), self.device)
+            observation = move_to_device(collate_batch(input, self.max_circuit_length), self.device)
             return self.forward(observation)  
 
 
     
     ## 真正有一个batch时可能会不同
     def circuits2onehot(self, circuits, batch_size, max_length_circuit):
-        
-        pad_value = -1
-        batch_size, seq_len = circuits.shape
-        pad_right = max_length_circuit - seq_len
-        circuits_padded = F.pad(circuits, (0, pad_right), value=pad_value)
+        """
+        将 circuits 三列 (gate, location, control) 编码为 one-hot 格式，
+        并正确处理 padding（值为 -1 的项将被编码为全 0 向量）。
+        """
+        gates = circuits[:, :, 0].clone().to(self.device)
+        locations = circuits[:, :, 1].clone().to(self.device)
+        control = circuits[:, :, 2].clone().to(self.device)
 
-        gate_indexs = circuits[:, :, 0].to(self.device)
-        gates= circuits[:, :, 0].to(self.device)
-        locations = circuits[:, :, 1]
-        control = circuits[:, :, 2]
+        # === Create masks to detect valid entries ===
+        gates_mask = gates != -1
+        loc_mask = locations != -1
+        ctrl_mask = control != -1
 
+        # === Replace -1 with dummy value for one_hot ===
+        gates[gates == -1] = 0
+        locations[locations == -1] = 0
+        control[control == -1] = 0
+
+        # === One-hot encode ===
         gates_one_hot = F.one_hot(gates, num_classes=self.num_gate_types).float()
         locations_one_hot = F.one_hot(locations, num_classes=self.num_qubits).float()
-        control_one_hot = F.one_hot(control, num_classes=self.num_qubits).float()  ##考虑单量子比特门控制比特onehot为零
+        control_one_hot = F.one_hot(control, num_classes=self.num_qubits).float()
 
+        # === Zero-out padding locations ===
+        gates_one_hot[~gates_mask] = 0.0
+        locations_one_hot[~loc_mask] = 0.0
+        control_one_hot[~ctrl_mask] = 0.0
+
+        # === Concatenate all one-hot encodings ===
         circuits_onehot = torch.cat([gates_one_hot, locations_one_hot, control_one_hot], dim=-1)
 
-
+        # === Sanity check ===
         assert circuits_onehot.shape[:2] == (batch_size, max_length_circuit), \
-                    f"Shape mismatch: got {circuits_onehot.shape}, expected ({batch_size}, {max_length_circuit}, ?)"
+            f"Shape mismatch: got {circuits_onehot.shape}, expected ({batch_size}, {max_length_circuit}, ?)"
+
         return circuits_onehot
+
     
     
     def get_position_encoding(self, seq_len, dim, device):
@@ -1080,7 +1327,6 @@ class AlphaCirRepNet(nn.Module):
         获取 sinusoidal 位置编码，shape 为 [seq_len, dim]
         """
         position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)  # [seq_len, 1]
-        #dim 要为偶数？？？
         div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / dim))
     
         pe = torch.zeros(seq_len, dim, device=device)
@@ -1089,6 +1335,47 @@ class AlphaCirRepNet(nn.Module):
     
         return pe  # [seq_len, dim]
 
+    def get_position_encoding_with_mask(self, seq_len, dim, device, circuits_length=None):
+        """
+        获取 sinusoidal 位置编码，支持 mask 掉 padding 部分。
+        
+        Args:
+            seq_len (int): 电路的最大长度（padding 后的长度）
+            dim (int): 编码维度，等于嵌入维度
+            device: 当前计算设备
+            circuits_length (Tensor or None): shape (batch_size,)
+                每个样本真实的电路长度。如果为 None，则不做 mask。
+        
+        Returns:
+            Tensor: shape [batch_size, seq_len, dim]，padding 位置编码为 0
+        """
+
+        # [seq_len, 1]
+        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)
+
+        # 频率因子 [dim/2]
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / dim))
+
+        # [seq_len, dim]
+        pe = torch.zeros(seq_len, dim, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        if circuits_length is None:
+            # 没有 mask：返回 [1, seq_len, dim]
+            return pe.unsqueeze(0)
+
+        # circuits_length: shape [batch_size]
+        batch_size = circuits_length.shape[0]
+
+        # 构造 mask：[batch_size, seq_len]
+        mask = torch.arange(seq_len, device=device).unsqueeze(0) < circuits_length.unsqueeze(1)
+
+        # mask shape: [batch_size, seq_len, 1]
+        mask = mask.unsqueeze(-1).float()
+
+        # 将 pe 扩展为 [batch_size, seq_len, dim] 后乘以 mask
+        return pe.unsqueeze(0) * mask
 
 
 ###Prediction Network
@@ -1152,19 +1439,19 @@ class DistributionSupport(nn.Module):
     # )
         
         scalar = scalar.clamp(self.value_min, self.value_max)
-        print(f"scalar: {scalar}")
+        # print(f"scalar: {scalar}")
         batch_size = scalar.shape[0]
         
         # 缩放到 bin 的 float 下标（不取整）
         # eps = 1e-6
         # pos = ((scalar - self.value_min) / self.delta).clamp(0, self.num_bins - 1 - eps)
         pos = (scalar - self.value_min) / self.delta
-        print(f"pos: {pos}")
+        # print(f"pos: {pos}")
         lower_idx = pos.floor().long()
-        print(f"lower_idx: {lower_idx}")
+        # print(f"lower_idx: {lower_idx}")
         # upper_idx = lower_idx + 1
         upper_idx = (lower_idx + 1).clamp(0, self.num_bins - 1)
-        print(f"upper_idx: {upper_idx}")
+        # print(f"upper_idx: {upper_idx}")
 
         # 权重分配
         upper_w = pos - lower_idx.float()
@@ -1256,8 +1543,16 @@ class AlphaCirPreNet(nn.Module):
         ## 参考uniform network inference function
         self.eval()
         with torch.no_grad():
-           return self.forward(embedding)
-       
+            return self.forward(embedding)  
+
+def to_cpu_output(output: NetworkOutput) -> NetworkOutput:
+    return NetworkOutput(
+        value=output.value.cpu() if isinstance(output.value, torch.Tensor) else output.value,
+        fidelity_value_logits=output.fidelity_value_logits.cpu(),
+        length_value_logits=output.length_value_logits.cpu(),
+        policy_logits=output.policy_logits.cpu(),
+        hidden_state=output.hidden_state.cpu() if isinstance(output.hidden_state, torch.Tensor) else output.hidden_state
+    )
     
 
     
@@ -1269,41 +1564,245 @@ class AlphaCirPreNet(nn.Module):
 
 #################################################################
 ####################### Replay_Buffer-Start- #######################
-class ReplayBuffer(object):
-  """Replay buffer object storing games for training."""
 
-  def __init__(self, config: AlphaCirConfig):
-    self.window_size = config.window_size #最多存多少局游戏（FIFO）
-    self.batch_size = config.batch_size #每次训练采样多少个训练样本
-    self.buffer = [] #保存所有游戏的列表，每一项是一个完整 Game 实例
+## Single-prcessing verison
+# class ReplayBuffer(object):
+#   """Replay buffer object storing games for training."""
+  
 
-  def save_game(self, game):
-    if len(self.buffer) >= self.window_size:
-      self.buffer.pop(0)
-    self.buffer.append(game)
+#   def __init__(self, config: AlphaCirConfig):
+#     self.window_size = config.window_size  # 最多存多少局游戏（FIFO）
+#     self.batch_size = config.batch_size    # 每次训练采样多少个训练样本
+#     self.buffer = load_games()             # 保存所有游戏的列表，每一项是一个完整 Game 实例
 
-  def sample_batch(self, td_steps: int) -> Sequence[Sample]:
-    games = [self.sample_game() for _ in range(self.batch_size)]
-    game_pos = [(g, self.sample_position(g)) for g in games]
-    # pylint: disable=g-complex-comprehension
-    return [
-        Sample(
-            observation=g.make_observation(i), ## observation该包括什么呢？
-            bootstrap_observation=g.make_observation(i + td_steps), ## observation该包括什么呢？
-            target=g.make_target(i, td_steps, g.to_play()),
-        )
-        for (g, i) in game_pos
-    ]
-    # pylint: enable=g-complex-comprehension
+#   def save_game(self, game):
+#     if len(self.buffer) >= self.window_size:
+#         self.buffer.pop(0)
+#     self.buffer.append(game)
 
-  def sample_game(self) -> Game:
-    # Sample game from buffer either uniformly or according to some priority.
-    return self.buffer[0]
+#   def sample_batch(self, td_steps: int) -> Sequence[Sample]:
+    
+#     games = [self.sample_game() for _ in range(self.batch_size)]
+#     game_pos = [(g, self.sample_position(g)) for g in games]
+#     return [
+#         Sample(
+#             observation=g.make_observation(i),
+#             bootstrap_observation=g.make_observation(i + td_steps),
+#             target=g.make_target(i, td_steps, g.to_play()),
+#         )
+#         for (g, i) in game_pos
+#     ]
 
-  # pylint: disable-next=unused-argument
-  def sample_position(self, game) -> int:
-    # Sample position from game either uniformly or according to some priority.
-    return -1
+#   def sample_game(self) -> Game:
+    
+#     return random.choice(self.buffer) if self.buffer else None
+
+#   def sample_position(self, game) -> int:
+#     return random.randint(0, len(game.history) - 1) if game and len(game.history) > 0 else -1
+
+
+def move_game_to_cpu(game):
+    """
+    将 Game 对象中所有在 GPU 上的 torch.Tensor 成员移到 CPU。
+    """
+    for name, value in game.__dict__.items():
+        # 如果是 Tensor，则移动到 CPU
+        if isinstance(value, torch.Tensor):
+            game.__dict__[name] = value.detach().cpu()
+
+        # 如果是 list，则尝试处理其中每个元素
+        elif isinstance(value, list):
+            new_list = []
+            for v in value:
+                if isinstance(v, torch.Tensor):
+                    new_list.append(v.detach().cpu())
+                else:
+                    new_list.append(v)
+            game.__dict__[name] = new_list
+
+        # 如果是 dict，则尝试处理其中每个值
+        elif isinstance(value, dict):
+            new_dict = {}
+            for k, v in value.items():
+                if isinstance(v, torch.Tensor):
+                    new_dict[k] = v.detach().cpu()
+                else:
+                    new_dict[k] = v
+            game.__dict__[name] = new_dict
+
+    return game
+
+
+def load_games(path = None, filename="games.pkl", folder="saved_games" ):
+    # print("path:", path)
+    if path is None:
+        path = os.path.join(folder, filename)
+    # print("os.path.exists(path)", os.path.exists(path))
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            games = pickle.load(f)
+        return games
+    else:
+        print("No saved games now, initialization.")
+        return []
+
+
+class ReplayBuffer:
+    """基于多进程 Manager 的安全 ReplayBuffer，供多个 self-play actor 写入、trainer 读取训练数据。"""
+
+    def __init__(self, config: AlphaCirConfig):
+        self.window_size = config.window_size
+        self.batch_size = config.batch_size
+        self._buffer = load_games(path="saved_games/games.pkl")  # ⬅️ 初始化加载 
+
+
+    @property
+    def buffer(self):
+        self._buffer = load_games(path="saved_games/games.pkl")  # ⬅️ 读取最新的游戏数据
+        return self._buffer  # 读取游戏数据
+        # print(" in buffer")
+        # buffer_cpu = []
+        # print(" in buffer 1")
+        # buffer = load_games()
+        # print(" in buffer 2")
+        # for game in buffer:
+        #     print("game", game)
+        # for game in buffer:
+        #     # print("game", game)
+        #     # game = move_game_to_cpu(game)
+        #     # print("game after cpu", game)
+        #     buffer_cpu.append(game)
+        #     # print("game append", game)
+        # return buffer
+    
+    def save_buffer_to_file(self, buffer_new, path):
+        path_saved = "saved_games/games.pkl"
+        buffer_temp = copy.deepcopy(self.buffer)
+        buffer_temp.extend(buffer_new)
+        if len(self._buffer) > self.window_size:
+            buffer_temp = buffer_temp[-self.window_size:]
+        with open(path, "wb") as f:
+            pickle.dump(buffer_temp, f)
+        os.replace(path, path_saved)  # 原子替换
+
+
+
+    def sample_batch(self, td_steps: int) -> Sequence[Sample]:
+        
+        game_histories = [self.sample_game() for _ in range(self.batch_size)]
+        game_pos = [(gh, self.sample_position(gh)) for gh in game_histories]
+
+    
+
+        return [
+            Sample(
+                observation=copy.deepcopy(gh[i]),
+                bootstrap_observation=copy.deepcopy(gh[i + td_steps]) if i + td_steps < len(gh) else copy.deepcopy(gh[-1]),
+                target=make_target(gh, i, td_steps),
+            )
+
+            for (gh, i) in game_pos
+        ]
+
+    def sample_game(self) -> Game:    
+        return random.choice(self.buffer) if self.buffer else None
+
+    def sample_position(self, game_history) -> int:
+        return random.randint(0, len(game_history) - 1) if game_history and len(game_history) > 0 else -1
+
+# def make_target(game_history:list, state_index, td_steps: int) -> np.ndarray: #In CPU
+#         """Creates the value target for training."""
+#     # The value target is the discounted sum of all rewards until N steps
+#     # into the future, to which we will add the discounted boostrapped future
+#     # value.
+#         f_rewards = 0.0
+#         l_rewards = 0.0
+#         gamme = game_history[state_index]["discount"]
+#         bootstrap_index = state_index + td_steps
+#         for i in range(state_index, min(bootstrap_index, len(game_history) )):
+          
+#             discount = gamme**( i - state_index )
+#             f_rewards += game_history[i]["f_reward"] * discount
+#             l_rewards += game_history[i]["l_reward"] * discount
+
+
+
+#         if bootstrap_index < len(game_history):
+#             bootstrap_discount = gamme**td_steps
+#         else:
+#             bootstrap_discount = 0
+
+#         return Target(
+#             f_rewards,
+#             l_rewards,
+#             game_history[state_index]["child_visits"], ## np.array
+#             bootstrap_discount,
+#         )
+    
+def make_target(game_history: list, state_index: int, td_steps: int) -> Target:
+    f_rewards = 0.0
+    l_rewards = 0.0
+    gamma = game_history[state_index]["discount"]
+
+    for i in range(state_index, min(state_index + td_steps, len(game_history))):
+        factor = gamma ** (i - state_index)
+        f_rewards += game_history[i]["f_reward"] * factor
+        l_rewards += game_history[i]["l_reward"] * factor
+
+    bootstrap_discount = gamma ** td_steps if state_index + td_steps < len(game_history) else 0.0
+
+    return Target(
+        f_rewards,
+        l_rewards,
+        game_history[state_index]["child_visits"],
+        bootstrap_discount,
+    )
+
+
+
+
+
+
+
+
+
+
+# class ReplayBuffer(object):
+#   """Replay buffer object storing games for training."""
+#   ### Multi-prcessing verison
+
+#   def __init__(self, config: AlphaCirConfig):
+#     self.window_size = config.window_size  # 最多存多少局游戏（FIFO）
+#     self.batch_size = config.batch_size    # 每次训练采样多少个训练样本
+#     self.buffer = load_games()             # 保存所有游戏的列表，每一项是一个完整 Game 实例
+#     self.lock = Lock()                     # 多进程锁，确保进程安全读写 buffer
+
+#   def save_game(self, game):
+#     with self.lock:
+#         if len(self.buffer) >= self.window_size:
+#             self.buffer.pop(0)
+#         self.buffer.append(game)
+
+#   def sample_batch(self, td_steps: int) -> Sequence[Sample]:
+#     with self.lock:
+#         games = [self.sample_game() for _ in range(self.batch_size)]
+#         game_pos = [(g, self.sample_position(g)) for g in games]
+#         return [
+#             Sample(
+#                 observation=g.make_observation(i),
+#                 bootstrap_observation=g.make_observation(i + td_steps),
+#                 target=g.make_target(i, td_steps, g.to_play()),
+#             )
+#             for (g, i) in game_pos
+#         ]
+
+#   def sample_game(self) -> Game:
+#     with self.lock:
+#         return random.choice(self.buffer) if self.buffer else None
+
+#   def sample_position(self, game) -> int:
+#     return random.randint(0, len(game.history) - 1) if game and len(game.history) > 0 else -1
+
 
 #################################################################
 ####################### Replay_Buffer- End - #######################
@@ -1316,19 +1815,69 @@ def make_uniform_network(num_actions: int) -> UniformNetwork:
 class SharedStorage(object):
   """Controls which network is used at inference."""
 
-  def __init__(self, num_actions: int):
+  def __init__(self, num_actions: int, config: AlphaCirConfig, model_dir="saved_models"):
     self._num_actions = num_actions
+    self.config = config
     self._networks = {}
+    self._optimizers = {}
+    self.model_dir = model_dir
+    self._optimizer_state_dict = None
+
+    # 尝试加载已有模型
+    os.makedirs(model_dir, exist_ok=True)
+    model_files = glob.glob(os.path.join(model_dir, "network_step_*.pt"))
+
+    if model_files:
+        extract_step = lambda f: int(re.findall(r"network_step_(\d+).pt", f)[0])
+        latest_file = max(model_files, key=extract_step)
+        latest_step = extract_step(latest_file)
+
+        print(f"已存储的最新模型: {latest_file}")
+        checkpoint = torch.load(latest_file)
+        # print("checkpoint", checkpoint.keys())
+
+        model = AlphaCirNetwork(self.config.hparams, self.config.task_spec)
+        model.load_state_dict(checkpoint["network_state"])
+        self._networks[latest_step] = model
+
+        # ✅ 存储优化器状态
+        self._optimizer_state_dict = checkpoint["optimizer_state"]
+    # else: 
+    #    print("初始化失败")
+
 
   def latest_network(self) -> AlphaCirNetwork:
     if self._networks:
+    #   print("get latest network")
+      # Return the latest network (highest step number).
+      print("stored network exists, start with latest network")
+
       return self._networks[max(self._networks.keys())]
     else:
       # policy -> uniform, value -> 0, reward -> 0
+      print("None stored network, start with uniform network")
       return make_uniform_network(self._num_actions)
 
-  def save_network(self, step: int, network: AlphaCirNetwork):
-    self._networks[step] = network
+  def save_network(self, step: int, network: AlphaCirNetwork, optimizer: torch.optim.Optimizer):
+    ## 存储在saved_networks文件中
+    ## 只保存AlphaCirNetwork
+    if isinstance(network, AlphaCirNetwork):
+        # === 及时存储 ===
+        # print("存储")
+        self._networks[step] = copy.deepcopy(network)
+
+        # === 硬盘存储 ===
+        os.makedirs(self.model_dir, exist_ok=True)  # 如果不存在则创建
+        path = os.path.join(self.model_dir, f"network_step_{step}.pt")  # 文件名中包含 step 方便排序
+        
+        save_dict = {
+            "network_state": network.state_dict(),  
+        }
+        if optimizer is not None:
+            save_dict["optimizer_state"] = optimizer.state_dict()  ## 保存优化器状态
+        torch.save(save_dict, path)  # 保存权重到指定路径
+        print(f"保存神经网络到文件: {path}")  # 提示用户保存成功
+
 
 
 
@@ -1376,8 +1925,10 @@ class Player:
         return f"Player({self.player_id}, type={self.player_type})"
 
 def softmax_sample(visit_counts: List[Tuple[int, Any]], temperature: float):
+    # print("visit_counts", visit_counts)
     visits = np.array([v for v, _ in visit_counts], dtype=np.float32)
-    
+    # print("visits", visits)
+    # print("temperature", temperature)
     if temperature == 0.0:
         # 贪婪：选择访问次数最多的动作
         max_visit = np.max(visits)
@@ -1386,8 +1937,11 @@ def softmax_sample(visit_counts: List[Tuple[int, Any]], temperature: float):
         return visit_counts[selected]
     
     # 否则按 softmax 分布采样
+    sum_visits = np.sum(visits)
+    # if sum_visits == 0:
+    #     sum_visits = num_simulations  # 避免除以零
     visits = visits ** (1 / temperature)  # 温度调整
-    probs = visits / np.sum(visits)      # softmax 概率
+    probs = visits / sum_visits      # softmax 概率
     index = np.random.choice(len(visit_counts), p=probs)
     return visit_counts[index]
 
@@ -1397,21 +1951,65 @@ def softmax_sample(visit_counts: List[Tuple[int, Any]], temperature: float):
 # snapshot, produces a game and makes it available to the training job by
 # writing it to a shared replay buffer.
 def run_selfplay(
-    config: AlphaCirConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
+    config: AlphaCirConfig, storage: SharedStorage, replay_buffer: ReplayBuffer, games_Queue = None, net = None
 ):
+#   print("run_selfplay start")
   if test_model:
     for _ in tqdm(range(test_model_run)):
-        network = storage.latest_network()
+        if net is not None:
+            network = net
+        else:
+            network = storage.latest_network()
+        
         game = play_game(config, network)
         replay_buffer.save_game(game)
+        save_game_to_file(replay_buffer.buffer, filename=f"games.pkl")
      
   else:
+    # print("run_selfplay start with multiprocessing")
+    
+    # print("num:", num)
+    
+    # print("标签0")
+    num = len(replay_buffer.buffer)
+    pbar = tqdm(desc=f"[{current_process().name}] Stored Games", unit=" games", initial=len(replay_buffer.buffer))
+
     while True:
+        # print("in while:")
+
+        buffer_size = len(replay_buffer.buffer)
+        pbar.n = buffer_size
+        pbar.refresh()
+        
         network = storage.latest_network()
-        game = play_game(config, network)
-        replay_buffer.save_game(game)
+        # network = AlphaCirNetwork(config.hparams, config.task_spec).to("cpu")
+        # network.load_state_dict(storage.latest_network().state_dict())
+        network.eval()
+        # print("get net:")
+        game_history = play_game(config, network)
+        # print(f"{current_process().name} generated game history:", game_history)
+        recorder_fid.add_scalar("SelfPlay/Fidelity", game_history[-1]["fidelity"], num)
+        # print("标签1")
+        games_Queue.put(game_history)  # 将游戏放入队列供训练使用
+        # print("标签2")
+        ## 存储数据
+        # replay_buffer.save_game(game)
+        # save_game_to_file(replay_buffer.buffer, filename=f"games.pkl")
+        
+        ## tqdm 进度条更新
+        # pbar.update(1) 
+        # print("标签3")
+        num += 1
 
 
+def move_network_output_to_cpu(output: NetworkOutput) -> NetworkOutput:
+    return NetworkOutput(
+        value=output.value.cpu() if isinstance(output.value, torch.Tensor) else output.value,
+        fidelity_value_logits=output.fidelity_value_logits.cpu(),
+        length_value_logits=output.length_value_logits.cpu(),
+        policy_logits=output.policy_logits.cpu(),
+        hidden_state=None  # 或 output.hidden_state.cpu() 如果有的话
+    )
 
 def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
   """Plays an AlphaCir game.
@@ -1427,8 +2025,10 @@ def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
   Returns:
     The played game.
   """
+  print("play_game start")
+  game = Game(config.task_spec)
+  game_history = [] 
 
-  game = Game(config.task_spec) 
 
   while not game.terminal() and len(game.history) < config.max_moves:
     min_max_stats = MinMaxStats(config.known_bounds)
@@ -1438,11 +2038,22 @@ def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
     # if test_model:
     #     print("test model INI: root", root)
     current_observation = game.make_observation(-1)
-    if test_model:
-        print("test model: current_observation", current_observation)
+    # if test_model:
+    # print("test model: current_observation", current_observation)
     network_output = network.inference(current_observation)
+    # for name, value in network_output.__dict__.items():
+    #     if isinstance(value, torch.Tensor) and value.is_cuda:
+    #         print(f"⚠️ GPU Tensor in play game 未释放：{name}")
+    #     else:
+    #         print(f"✅ {name} 正常 in play game")
+    # if test_model:
+    #     print("test model: current_network_output", network_output)
     ## game.legal_actions(): the list of indices of legal actions
     # legal_actions: the list of legal Actions
+
+
+
+
     legal_actions_index =  game.legal_actions() ## 未生效
 
 
@@ -1479,16 +2090,24 @@ def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
         min_max_stats,
         game,
     )
+    # print("root", root.children)
     # action:Action  选择动作完全根据概率分布 
     action = _select_action(config, len(game.history), root, network, legal_actions_index)
     index = action.index
     gate = index2action(index, config.task_spec.num_qubits, config.task_spec.num_actions)  # ["H", 0, 0]
     game.step(gate)
-    if test_model:
-        print("test model: gate", gate)
-        print("test model: game history", game.history)
+    # print("visit situation", game.child_visits)
+    
+    # if test_model:
+    #     # print("test model: gate", gate)
+    #     print("test model: game history in play game, actual applied ", game.history)
     game.store_search_statistics(root)
-  return game
+    # print("visit situation after store", game.child_visits)
+    # game = move_to_cpu(game)
+    game_step = game.render()
+    game_history.append(game_step)  # 将每一步的游戏状态添加到历史记录中
+
+  return game_history
 
 
 def run_mcts(
@@ -1523,12 +2142,15 @@ def run_mcts(
     sim_env = copy.deepcopy(env)
 
     while node.expanded():
-      action, node = _select_child(config, node, min_max_stats)
-      index = action.index
-      gate = index2action(index, config.task_spec.num_qubits, config.task_spec.num_actions)  # ["H", 0, 0]
-      observation, reward, _, _, _ = sim_env.step(gate)
-      history.add_action(action)
-      search_path.append(node)
+        action, node = _select_child(config, node, min_max_stats)
+        index = action.index
+        gate = index2action(index, config.task_spec.num_qubits, config.task_spec.num_actions)  # ["H", 0, 0]
+        observation, reward, _, _, _ = sim_env.step(gate)
+        history.add_action(action)
+        search_path.append(node)
+        ## MCTS中也不许超过最大长度
+        if sim_env.simulator.length_qc >= config.task_spec.max_circuit_length:
+            break
 
     # Inside the search tree we use the environment to obtain the next
     # observation and reward given an action.   self.render(), reward, fidelity_reward, length_reward, self.is_terminal
@@ -1545,23 +2167,45 @@ def run_mcts(
         config.discount,
         min_max_stats,
     )
+#   print(f"[MCTS Done] Root has {len(root.children)} children.")
 
 
 def _select_action(
     # pylint: disable-next=unused-argument
     config: AlphaCirConfig, num_moves: int, node: Node, network: AlphaCirNetwork, legal_actions_index: List[int]
 ):
-  ## 让未在合法动作列表中的动作的访问次数为0
+  
+    # print("Expected indices:", legal_actions_index)
+    # print("Node children keys:", [a.index for a in node.children.keys()])
 
     visit_counts = []
+    # visit_counts_before =[]
+    # print("legal_actions_index",legal_actions_index)
     for action, child in node.children.items():
+        # visit_counts_before.append((child.visit_count, action))
+        # print("action index", action.index)
         if action.index not in legal_actions_index:
+            # print("illegal action", action.index)
+            # print("visit count before ilegal ", child.visit_count)
             child.visit_count = 0  # 非法动作访问次数设为 0
         visit_counts.append((child.visit_count, action))  
 
-    t = config.visit_softmax_temperature_fn(
-      steps=network.training_steps()
-  )
+    total_visits = sum([v for v, _ in visit_counts])
+    visit_average = int(config.num_simulations/len(legal_actions_index))
+    if total_visits == 0:
+        visit_counts = []
+        for action, child in node.children.items():
+            if action.index not in legal_actions_index:
+                child.visit_count = 0  # 非法动作访问次数设为 0
+            else:
+                child.visit_count = visit_average
+            visit_counts.append((child.visit_count, action)) 
+
+    
+    # print("visit_counts_before", visit_counts_before)
+    # print("visit_counts", visit_counts)
+    steps = network.training_steps
+    t = config.visit_softmax_temperature_fn(steps)
     _, action = softmax_sample(visit_counts, t)
     return action ## Action
 
@@ -1572,9 +2216,10 @@ def _select_child(
   """Selects the child with the highest UCB score."""
 
   _, action, child = max(
-      (_ucb_score(config, node, child, min_max_stats), action, child)
-      for action, child in node.children.items()
-  )
+        (( _ucb_score(config, node, child, min_max_stats), action, child )
+        for action, child in node.children.items()),
+        key=lambda x: x[0]  
+    )
 
   return action, child
 
@@ -1624,6 +2269,8 @@ def _expand_node(
   node.to_play = to_play
   node.hidden_state = network_output.hidden_state
   node.reward = reward
+#   if test_model:
+#     print("test model: actions", actions)
 #   if test_model:    
 #     print("test model:network_output.policy_logits", network_output.policy_logits )
 #     print("test model:actions", actions)
@@ -1633,7 +2280,10 @@ def _expand_node(
 #     print("test model: network_output.policy_logits[a.index]", item)
 #     prob = torch.exp(item)
 #     print("test model: prob", prob)
-  policy = { a: torch.exp(network_output.policy_logits[0, a.index]) for a in actions}
+#   if test_model:
+#     print("test model: network_output.policy_logits", network_output.policy_logits)
+  policy_logits = network_output.policy_logits.squeeze(0)  # shape: [num_actions]
+  policy = { a: torch.exp(policy_logits[a.index]) for a in actions}
 
 #   if test_model:
 #     print("test model:policy", policy)
@@ -1684,96 +2334,281 @@ def _add_exploration_noise(config: AlphaCirConfig, node: Node):
 
 #################################################################
 ######################## Trainer -Start- #######################
+class Trainer:
+    def __init__(self, config: AlphaCirConfig, storage: SharedStorage, replay_buffer: ReplayBuffer):    
+       self.config = config
+       self.storage = storage
+       self.replay_buffer = replay_buffer
+       self.device = self.config.hparams.device
+       self.network = self.storage.latest_network().to(self.device)
 
-def train_network(config: AlphaCirConfig, storage, replay_buffer):
-    """Trains the network on data stored in the replay buffer."""
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = config.hparams.device
-    network = AlphaCirNetwork(config.hparams, config.task_spec).to(device)
-    target_network = AlphaCirNetwork(config.hparams, config.task_spec).to(device)
-    target_network.load_state_dict(network.state_dict())  # 初始化目标网络
+       if isinstance(self.network, AlphaCirNetwork):
+           print("Trainer: network is AlphaCirNetwork")
 
-    optimizer = torch.optim.SGD(network.parameters(), lr=config.lr_init, momentum=config.momentum)
-
-    for i in range(config.training_steps):
-        if i % config.checkpoint_interval == 0:
-            storage.save_network(i, network)
-
-        if i % config.target_network_interval == 0:
-            target_network.load_state_dict(network.state_dict())
-
-        batch = replay_buffer.sample_batch(config.td_steps)
-        optimizer.zero_grad()
-        loss = compute_loss(network, target_network, batch, device)
-        loss.backward()
-        optimizer.step()
-
-    storage.save_network(config.training_steps, network)
-
-
-def compute_loss(network, target_network, batch, device):
-    observations, bootstrap_obs, targets = zip(*batch)
-
-    obs_batch = move_to_device(collate_batch(list(observations)), device)
-    boot_batch = move_to_device(collate_batch(list(bootstrap_obs)), device)
-
-    # 解包 targets
-    fidelity_value, length_value, policy, discount = zip(*targets)
-    fidelity_value = torch.stack(fidelity_value).to(device)
-    length_value = torch.stack(length_value).to(device)
-    policy = torch.stack(policy).to(device)
-    discount = torch.tensor(discount).to(device)
-
-    # 推理
-    pred = network(obs_batch)
-    pred_boot = target_network(boot_batch)
-
-    # TD Bootstrapped target
-    fidelity_value += discount.unsqueeze(1) * pred_boot["fidelity_value_logits"].detach()
-    length_value += discount.unsqueeze(1) * pred_boot["length_value_logits"].detach()
-
-    # Loss
-    policy_loss = soft_cross_entropy(pred["policy"], policy)
-    fidelity_loss = scalar_loss(pred["fidelity_value_logits"], fidelity_value, network)
-    length_loss = scalar_loss(pred["length_value_logits"], length_value, network)
-
-    return (policy_loss + fidelity_loss + length_loss)/ len(batch)
+       if isinstance(self.network, UniformNetwork):
+          self.network = AlphaCirNetwork(self.config.hparams, self.config.task_spec).to(self.device)
+          self.train_step = 0
+       else:
+            # 从已有网络中取出最大的 step
+          self.train_step = max(self.storage._networks.keys())
+       self.optimizer = torch.optim.SGD(self.network.parameters(), lr=self.config.lr_init, momentum=self.config.momentum)
+       if storage._optimizer_state_dict is not None:
+            self.optimizer.load_state_dict(self.storage._optimizer_state_dict)
+            print("已恢复 optimizer 状态") 
+            for state in self.optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(self.device)
 
 
-    # total_loss = 0.0
+    def train_network(self):
+        """Trains the network on data stored in the replay buffer."""
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("train start")
+        losses = []
 
-    # for observation, bootstrap_obs, target in batch:
-    #     # Move tensors to device
-    #     observation = move_to_device(observation, device)
-    #     bootstrap_obs = move_to_device(bootstrap_obs, device)
-    #     ## target_fidelity_value, target_length_value: reward[1] + γ * reward[2] + γ² * reward[3]
-    #     target_fidelity_value, target_length_value, target_policy, bootstrap_discount = target
 
-    #     # Forward pass
-    #     # observation: [{"circuit":..., "matrix":..., "circuit_length":...}, {}...]
+        
+        target_network = AlphaCirNetwork(self.config.hparams, self.config.task_spec).to(self.device)
+        target_network.load_state_dict(self.network.state_dict())  # 初始化目标网络
 
-    #     predictions = network(observation)
-    #     bootstrap_predictions = target_network(bootstrap_obs)
+        for i in tqdm(range(self.train_step, self.train_step + self.config.max_training_steps), desc="Training Network"):
+            
+            
+            for name, param in self.network.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"⚠️ 网络参数 {name} 含 NaN")
+                # else:
+                #     print(f"网络参数 {name} 正常")
+                    
+            
+            for name, param in target_network.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"⚠️ 目标网络参数 {name} 含 NaN")
+                # else:
+                #     print(f"目标网络参数 {name} 正常")
 
-    #     # Unpack predictions
-    #     policy_logits = predictions["policy"]
-    #     fidelity_logits = predictions["fidelity_value_logits"]
-    #     length_logits = predictions["length_value_logits"]
+            batch = self.replay_buffer.sample_batch(self.config.td_steps)
+            self.optimizer.zero_grad()
+            loss = self.compute_loss(self.network, target_network, batch, self.device, i)
+            recorder_loss.add_scalar("Loss/total", loss.item(), i)
 
-    #     # Target for value（加上 TD bootstrapping）
-    #     bootstrap_fidelity_value = bootstrap_predictions["fidelity_value_logits"].detach()
-    #     bootstrap_length_value = bootstrap_predictions["length_value_logits"].detach()
-    #     # target_fidelity = reward[1] + γ * reward[2] + γ² * reward[3] + γ³ * V(s_4)
-    #     target_fidelity_value += bootstrap_discount* bootstrap_fidelity_value
-    #     target_length_value += bootstrap_discount *  bootstrap_length_value
-    #     ## 可能会存在问题
-    #     policy_loss = soft_cross_entropy(policy_logits, target_policy)  
-    #     fidelity_loss = scalar_loss(fidelity_logits, target_fidelity_value, network)
-    #     length_loss = scalar_loss(length_logits, target_length_value, network)
+            # print("loss", loss)
+            assert not math.isnan(loss), "Loss 是 NaN"
+            assert loss.item() >= 0, "Loss 是负数"
 
-    #     total_loss += policy_loss + fidelity_loss + length_loss
+            
+            losses.append(loss.item())
+            model_before = copy.deepcopy(self.network)
 
-    # return total_loss / len(batch)
+            # print("👉 反向传播前，检查梯度是否为 NaN")
+            for name, param in self.network.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"⚠️ 梯度 NaN: {name}")
+
+            loss.backward()
+
+            for name, param in self.network.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"⚠️ 梯度 NaN: {name}")
+            # print("👉 反向传播后，检查梯度是否为 NaN")
+
+
+
+
+            self.optimizer.step()
+            model_after = copy.deepcopy(self.network)
+
+            ## 记录参数变化量
+            total_change = 0.0
+            with torch.no_grad():
+                for (name_before, param_before), (name_after, param_after) in zip(model_before.named_parameters(), model_after.named_parameters()):
+                    assert name_before == name_after, "参数名称不一致，模型结构可能不同"
+                    delta = (param_before - param_after).abs().sum().item()
+                    total_change += delta
+                    # print(f"{name_before} 参数变化量: {delta:.6f}")
+
+            recorder_params.add_scalar("param_change/total", total_change, i)
+
+            # print(f"💡 参数总变化量: {total_change:.6f}")
+
+            ## 记录平均梯度范数
+            total_norm = 0.0
+            count = 0
+            for _, param in self.network.named_parameters():
+                if param.grad is not None:
+                    total_norm += param.grad.norm().item()
+                    count += 1
+            avg_grad_norm = total_norm / count if count > 0 else 0
+            recorder_params.add_scalar("grad_norm/avg", avg_grad_norm, i)
+
+
+            if i % self.config.checkpoint_interval == 0:
+                if i > self.train_step:
+                    index = max(self.storage._networks.keys())
+                    old_net =copy.deepcopy(self.storage._networks[index])
+                    current_network = copy.deepcopy(self.network)                
+                    assert not networks_equal(old_net, current_network), "旧的网络和当前网络相同"
+                self.storage.save_network(i, self.network, self.optimizer)
+            time.sleep(1)          
+
+            if i % self.config.target_network_interval == 0:
+                target_network.load_state_dict(self.network.state_dict())
+        
+        self.storage.save_network(self.config.max_training_steps, self.network, self.optimizer)
+        return losses
+
+    def compute_loss(self, network, target_network, batch, device, i):
+        observations, bootstrap_obs, targets = zip(*batch)
+
+        obs_batch = move_to_device(collate_batch(list(observations), network.representation.max_circuit_length), device)
+        boot_batch = move_to_device(collate_batch(list(bootstrap_obs), network.representation.max_circuit_length), device)
+
+        # 解包 targets
+        fidelity_value, length_value, policy, discount = zip(*targets)
+        fidelity_value = torch.tensor(fidelity_value, dtype=torch.float32, device=device)
+        length_value   = torch.tensor(length_value, dtype=torch.float32, device=device)
+        policy = np.stack(policy)  # policy 是 list/tuple of np.array
+        policy = torch.from_numpy(policy).to(dtype=torch.float32, device=device)
+        # print("看看 policy", policy)
+        # policy_tensor = torch.tensor(policy, dtype=torch.float32)
+        # policy = torch.stack(policy_tensor).to(device)
+        discount = torch.tensor(discount, dtype=torch.float32, device = device)
+
+        # target_network.support.mean()
+        # 推理
+        # print("obs_prenet", obs_batch)
+        # print("boot_prenet", boot_batch)
+
+        assert not torch.isnan(obs_batch['circuits']).any(), "obs_batch['circuits'] 含 NaN"
+        assert not torch.isinf(obs_batch['circuits']).any(), "obs_batch['circuits'] 含 Inf"
+
+
+        # 在这里调用：
+        assert_tensor_on_cuda(
+            fidelity_value=fidelity_value,
+            length_value=length_value,
+            policy=policy,
+            discount=discount
+        )
+
+        for name, param in network.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"⚠️ 参数 {name} 包含 NaN 或 Inf")
+            # else:
+            #     print(f"参数 {name} 正常")
+        for name, param in target_network.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"⚠️ 目标参数 {name} 包含 NaN 或 Inf")
+            # else:
+            #     print(f"目标参数 {name} 正常")
+
+        # for name, param in network.named_parameters():
+        #     print(f"{name}: mean={param.data.mean().item():.6f}, std={param.data.std().item():.6f}")
+
+
+        for name, module in network.named_modules():
+            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Conv1d, nn.ReLU)):
+                register_nan_hook(module)
+
+        # for name, module in network.named_modules():
+        #     if isinstance(module, (nn.Linear, nn.LayerNorm, nn.ReLU, nn.Softmax, nn.Conv1d)):
+        #         module.register_forward_hook(print_tensor_hook)
+
+        pred = network(obs_batch)
+        pred_boot = target_network(boot_batch)
+        # print("pred", pred)
+        # print("pred_boot", pred_boot)
+        # assert not torch.all(policy == 0), "Policy target 全为 0，loss 计算无效"
+        # print("policy target", policy) 
+        # print("policy_logits", pred.policy_logits)
+
+        # TD Bootstrapped target
+        # print("fidelity_value", fidelity_value.shape)
+        # print("discount", discount.shape)
+        # print("pred_boot.fidelity_value_logits", pred_boot.fidelity_value_logits.shape)
+        pred_f_value = target_network.prediction.support.mean(pred_boot.fidelity_value_logits)
+        fidelity_value += discount * pred_f_value.detach()
+        pre_l_value = target_network.prediction.support.mean(pred_boot.length_value_logits)
+        length_value += discount * pre_l_value.detach()
+
+        # Loss
+        policy_loss = soft_cross_entropy(pred.policy_logits, policy)
+        fidelity_loss = scalar_loss(pred.fidelity_value_logits, fidelity_value, network)
+        length_loss = scalar_loss(pred.length_value_logits, length_value, network)
+
+
+        recorder_loss.add_scalar("loss/policy", policy_loss.item(), i)
+        recorder_loss.add_scalar("loss/fidelity", fidelity_loss.item(), i)
+        recorder_loss.add_scalar("loss/length", length_loss.item(), i)
+        
+        # print("final policy_loss", policy_loss)
+        # print("final fidelity_loss", fidelity_loss)
+        # print("final length_loss", length_loss)   
+
+
+        # return (policy_loss + fidelity_loss + length_loss)/ len(batch)
+        return policy_loss + fidelity_loss + length_loss
+
+        # total_loss = 0.0
+
+        # for observation, bootstrap_obs, target in batch:
+        #     # Move tensors to device
+        #     observation = move_to_device(observation, device)
+        #     bootstrap_obs = move_to_device(bootstrap_obs, device)
+        #     ## target_fidelity_value, target_length_value: reward[1] + γ * reward[2] + γ² * reward[3]
+        #     target_fidelity_value, target_length_value, target_policy, bootstrap_discount = target
+
+        #     # Forward pass
+        #     # observation: [{"circuit":..., "matrix":..., "circuit_length":...}, {}...]
+
+        #     predictions = network(observation)
+        #     bootstrap_predictions = target_network(bootstrap_obs)
+
+        #     # Unpack predictions
+        #     policy_logits = predictions["policy"]
+        #     fidelity_logits = predictions["fidelity_value_logits"]
+        #     length_logits = predictions["length_value_logits"]
+
+        #     # Target for value（加上 TD bootstrapping）
+        #     bootstrap_fidelity_value = bootstrap_predictions["fidelity_value_logits"].detach()
+        #     bootstrap_length_value = bootstrap_predictions["length_value_logits"].detach()
+        #     # target_fidelity = reward[1] + γ * reward[2] + γ² * reward[3] + γ³ * V(s_4)
+        #     target_fidelity_value += bootstrap_discount* bootstrap_fidelity_value
+        #     target_length_value += bootstrap_discount *  bootstrap_length_value
+        #     ## 可能会存在问题
+        #     policy_loss = soft_cross_entropy(policy_logits, target_policy)  
+        #     fidelity_loss = scalar_loss(fidelity_logits, target_fidelity_value, network)
+        #     length_loss = scalar_loss(length_logits, target_length_value, network)
+
+        #     total_loss += policy_loss + fidelity_loss + length_loss
+
+        # return total_loss / len(batch)
+def print_tensor_hook(module, input, output):
+    if torch.isnan(output).any():
+        print(f"❌ {module.__class__.__name__} 输出包含 NaN")
+    elif torch.isinf(output).any():
+        print(f"⚠️ {module.__class__.__name__} 输出包含 Inf")
+    else:
+        print(f"✅ {module.__class__.__name__} 正常: mean={output.mean():.4f}, std={output.std():.4f}")
+
+def register_nan_hook(module):
+    def hook(module, input, output):
+        if isinstance(output, torch.Tensor) and torch.isnan(output).any():
+            print(f"⚠️ 输出 NaN in {module}")
+        elif isinstance(output, tuple):
+            for i, o in enumerate(output):
+                if torch.isnan(o).any():
+                    print(f"⚠️ 输出 NaN in {module}, output[{i}]")
+    return module.register_forward_hook(hook)
+
+def assert_tensor_on_cuda(**tensors):
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            print(f"❌ {name} 不是 Tensor 类型，而是 {type(tensor)}")
+        elif not tensor.is_cuda:
+            print(f"⚠️ 警告：{name} 不在 CUDA 上，而是在 {tensor.device}")
+
 
 def scalar_loss(pred_logits, scalar_target, network):
     """
@@ -1785,15 +2620,7 @@ def scalar_loss(pred_logits, scalar_target, network):
     loss = -(two_hot_target * log_probs).sum(dim=-1).mean()
     return loss
 
-def move_to_device(data, device):
-    if isinstance(data, torch.Tensor):
-        return data.to(device)
-    elif isinstance(data, dict):
-        return {k: move_to_device(v, device) for k, v in data.items()}
-    elif isinstance(data, (list, tuple)):
-        return [move_to_device(x, device) for x in data]
-    else:
-        return data
+
 
 
 #################################################################
@@ -1803,16 +2630,134 @@ def move_to_device(data, device):
 ########################### Main -Start- #######################
 
 
-def AlphaCir(config: AlphaCirConfig):
-  storage = SharedStorage()
-  replay_buffer = ReplayBuffer(config)
 
-  for _ in range(config.num_actors):
-    launch_job(run_selfplay, config, storage, replay_buffer)
 
-  train_network(config, storage, replay_buffer)
+def monitor_buffer_tqdm(replay_buffer, maximum_games):
+    from tqdm import tqdm
+    import time
 
-  return storage.latest_network()
+    with tqdm(total=maximum_games, desc="ReplayBuffer Size Monitor", position=0, leave=True) as pbar:
+        last_size = 0
+        while True:
+            current_size = len(replay_buffer.buffer)
+            delta = current_size - last_size
+            if delta > 0:
+                pbar.update(delta)
+                last_size = current_size
+            time.sleep(1)
+
+
+## single actor version
+def AlphaCir_single(config: AlphaCirConfig):
+    # maximum_games = 1000000
+    storage = SharedStorage(config.task_spec.num_actions, config)
+    replay_buffer = ReplayBuffer(config)
+    # print("buffer size:", len(replay_buffer.buffer))
+    # print(replay_buffer.buffer)
+    trainer = Trainer(config, storage, replay_buffer)
+    # losses = None
+
+    selfplay_thread = threading.Thread(
+        target=run_selfplay,
+        args=(config, storage, replay_buffer),
+        daemon=True  # 设置为守护线程，主程序结束就自动退出
+    )
+    selfplay_thread.start()
+
+    with tqdm(total=config.batch_size, desc="Filling ReplayBuffer") as pbar:
+        last = 0
+        while len(replay_buffer.buffer) <= config.batch_size:
+            current = len(replay_buffer.buffer)
+            pbar.update(current - last)
+            last = current
+            time.sleep(1)
+
+    # buffer_monitor_thread = threading.Thread(
+    #     target=monitor_buffer_tqdm,
+    #     args=(replay_buffer, maximum_games),  # 你可以改成 config.window_size
+    #     daemon=True
+    # )
+    # buffer_monitor_thread.start()
+            
+
+
+    print("ReplayBuffer已填满，开始训练！")
+    losses = trainer.train_network()
+
+    recorder_fid.close()
+    recorder_loss.close()
+    recorder_params.close()
+    return storage.latest_network(), losses
+
+def game_collector(buffer, games_queue):
+    buffer_temp = []
+    while True:
+        try:
+            game_history = games_queue.get(timeout = 1000)
+           # for name, value in game.__dict__.items():
+            #     if isinstance(value, torch.Tensor) and value.is_cuda:
+            #         print(f"⚠️ GPU Tensor 未释放：{name}")
+            #     else:
+            #         print(f"✅ {name} 正常")
+            buffer_temp.append(game_history)
+        except (queue.Empty, mp_Empty):
+            print("[Collector] No data for 1000 seconds, exit.")
+            break
+        if len(buffer_temp) >= 2:
+            buffer.save_buffer_to_file(buffer_temp, path="temp_games/games.pkl")
+            buffer_temp = []  # 清空临时缓冲区
+        # print("Game saved to buffer. Current size:", len(buffer.buffer))
+
+## multi actors version
+def AlphaCir_multi(config: AlphaCirConfig):     
+    de_daemon = True
+    storage = SharedStorage(config.task_spec.num_actions, config)     
+    replay_buffer = ReplayBuffer(config)   
+    print("buffer size:", len(replay_buffer.buffer))  
+    trainer = Trainer(config, storage, replay_buffer) 
+     # 启动多个 self-play actor 进程     
+    num_actors = config.num_actors if hasattr(config, 'num_actors') else 4  # 默认 4 个 actor  
+    # print("num_actors", num_actors)
+    games_Queue = Queue()   
+    collector_thread = threading.Thread(target=game_collector, args=(replay_buffer, games_Queue))
+    collector_thread.daemon = de_daemon  # 主程序结束它也结束
+    collector_thread.start()
+
+    # print("⚠️ here")
+    selfplay_processes = []     
+    for i in range(num_actors):  
+        p = Process(             
+            target=run_selfplay,  
+            name=f"Actor-{i+1}",           
+            args=(config, storage, replay_buffer, games_Queue),             
+            daemon = de_daemon,   ## trainer没有问题了 改回True
+                )         
+        p.start()  
+     
+        selfplay_processes.append(p) 
+     # 等待 ReplayBuffer 填满初始数据     
+  
+
+    with tqdm(total=config.batch_size, desc="Filling ReplayBuffer") as pbar:         
+        last = 0         
+        # print("ReplayBuffer size:", len(replay_buffer.buffer))
+        while len(replay_buffer.buffer) <= config.batch_size:             
+            current = len(replay_buffer.buffer)             
+            pbar.update(current - last)             
+            last = current             
+            time.sleep(10) 
+    print("ReplayBuffer已填满，开始训练！") 
+
+
+
+
+    loss = trainer.train_network()
+         
+    # 你可以根据需要监控进度或在外部控制退出 
+    recorder_fid.close()
+    recorder_loss.close()
+    recorder_params.close()
+    return storage.latest_network()
 
 
 def launch_job(f, *args):
@@ -1825,9 +2770,11 @@ def launch_job(f, *args):
 if __name__ == "__main__":
     # print(test_model_run) 
     config = AlphaCirConfig()
-    num_qubits = config.task_spec.num_qubits
-    type_single_gates = config.task_spec.num_ops
-
+    output = AlphaCir_multi(config)
+    
+    # num_qubits = self.config.task_spec.num_qubits
+    # type_single_gates = self.config.task_spec.num_ops
+    
 
 
 
