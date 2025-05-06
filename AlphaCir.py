@@ -25,6 +25,7 @@ import ml_collections
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.multiprocessing as tmp
 
 import cirq
 from qiskit import QuantumCircuit
@@ -45,6 +46,8 @@ recorder_loss = SummaryWriter(log_dir="records/losses")  # 可自定义路径
 recorder_params = SummaryWriter(log_dir="records/params")  # 可自定义路径
 GATES2Index = {"H": 0, "S": 1, "T": 2, "S†": 3, "T†": 4, "CX": 5}
 Index2GATES = {0:"H", 1:"S", 2:"T", 3: "S†", 4: "T†", 5:"CX"}
+
+# buffer_g = []
 #################################################################
 ######################### Tools -Start- #######################
 
@@ -269,21 +272,16 @@ def save_game_to_file(game, filename="games.pkl", folder="saved_games"):
 #         print("No saved games now, initialization.")
 #         return []
     
-def save_network_to_file(network, filename="network_dump.pkl", folder="saved_networks"):
-   pass
 
-def networks_equal(net1: nn.Module, net2: nn.Module) -> bool:
-    state_dict1 = net1.state_dict()
-    state_dict2 = net2.state_dict()
 
+def networks_equal(state_dict1: Dict[str, torch.Tensor], state_dict2: Dict[str, torch.Tensor]) -> bool:
     if state_dict1.keys() != state_dict2.keys():
         return False
-
     for key in state_dict1:
         if not torch.equal(state_dict1[key], state_dict2[key]):
             return False
-
     return True
+
 
 
 #################################################################
@@ -396,7 +394,7 @@ class AlphaCirConfig(object):
     self.hparams.prediction.hidden_dim = 128  # hidden_dim of the prediction network
 
     ### Training
-    self.max_training_steps = 1000# for test
+    self.max_training_steps = 5000# for test
     self.checkpoint_interval = 100 ## for test
     self.target_network_interval = 200
     self.window_size = int(1e6)
@@ -1643,7 +1641,7 @@ def load_games(path = None, filename="games.pkl", folder="saved_games" ):
             games = pickle.load(f)
         return games
     else:
-        print("No saved games now, initialization.")
+        print("No saved games in the remote file, initialization.")
         return []
 
 
@@ -1654,45 +1652,30 @@ class ReplayBuffer:
         self.window_size = config.window_size
         self.batch_size = config.batch_size
         self._buffer = load_games(path="saved_games/games.pkl")  # ⬅️ 初始化加载 
+        self._lock = threading.Lock()  # 添加锁，保证线程安全
 
 
     @property
     def buffer(self):
-        self._buffer = load_games(path="saved_games/games.pkl")  # ⬅️ 读取最新的游戏数据
-        return self._buffer  # 读取游戏数据
-        # print(" in buffer")
-        # buffer_cpu = []
-        # print(" in buffer 1")
-        # buffer = load_games()
-        # print(" in buffer 2")
-        # for game in buffer:
-        #     print("game", game)
-        # for game in buffer:
-        #     # print("game", game)
-        #     # game = move_game_to_cpu(game)
-        #     # print("game after cpu", game)
-        #     buffer_cpu.append(game)
-        #     # print("game append", game)
-        # return buffer
-    
-    def save_buffer_to_file(self, buffer_new, path):
-        path_saved = "saved_games/games.pkl"
-        buffer_temp = copy.deepcopy(self.buffer)
-        buffer_temp.extend(buffer_new)
-        if len(self._buffer) > self.window_size:
-            buffer_temp = buffer_temp[-self.window_size:]
-        with open(path, "wb") as f:
-            pickle.dump(buffer_temp, f)
-        os.replace(path, path_saved)  # 原子替换
+        # self._buffer = load_games(path="saved_games/games.pkl")  # ⬅️ 读取最新的游戏数据
+        with self._lock:
+            return list(self._buffer)  # 读取游戏数据
 
+    def append_games(self, new_game):
+        with self._lock:
+            self._buffer.append(new_game)
+            if len(self._buffer) > self.window_size:
+                self._buffer = self._buffer[-self.window_size:]
 
+    def save_buffer_to_file(self, path = "saved_games/games.pkl"):
+        with self._lock:
+            with open(path, "wb") as f:
+                pickle.dump(self._buffer, f)
 
     def sample_batch(self, td_steps: int) -> Sequence[Sample]:
         
         game_histories = [self.sample_game() for _ in range(self.batch_size)]
         game_pos = [(gh, self.sample_position(gh)) for gh in game_histories]
-
-    
 
         return [
             Sample(
@@ -1705,10 +1688,19 @@ class ReplayBuffer:
         ]
 
     def sample_game(self) -> Game:    
-        return random.choice(self.buffer) if self.buffer else None
+        if self.buffer and len(self.buffer) > 0:
+            game_return  = random.choice(self.buffer)
+        else:
+            raise ValueError("sample_game: buffer is empty or not loaded properly.")
+        return game_return 
 
     def sample_position(self, game_history) -> int:
-        return random.randint(0, len(game_history) - 1) if game_history and len(game_history) > 0 else -1
+        if game_history and len(game_history) > 0:
+            index = random.randint(0, len(game_history) - 1)
+        else: 
+            raise ValueError("sample_position: game_history is empty")
+
+        return index
 
 # def make_target(game_history:list, state_index, td_steps: int) -> np.ndarray: #In CPU
 #         """Creates the value target for training."""
@@ -1812,16 +1804,18 @@ def make_target(game_history: list, state_index: int, td_steps: int) -> Target:
 def make_uniform_network(num_actions: int) -> UniformNetwork:
     return UniformNetwork(num_actions)
 
+
 class SharedStorage(object):
   """Controls which network is used at inference."""
 
   def __init__(self, num_actions: int, config: AlphaCirConfig, model_dir="saved_models"):
     self._num_actions = num_actions
     self.config = config
-    self._networks = {}
-    self._optimizers = {}
+    self._networks = {}  ## paramaters for 主进程  Trainer
+    self._optimizer_state_dict = None  ## maxstep paramarters for 主进程 Trainer
+    self._optimizers = {}  ## paramaters for 主进程 Trainer
     self.model_dir = model_dir
-    self._optimizer_state_dict = None
+    
 
     # 尝试加载已有模型
     os.makedirs(model_dir, exist_ok=True)
@@ -1832,52 +1826,42 @@ class SharedStorage(object):
         latest_file = max(model_files, key=extract_step)
         latest_step = extract_step(latest_file)
 
-        print(f"已存储的最新模型: {latest_file}")
+        print(f"已加载的最新模型 in storage: {latest_file}")
         checkpoint = torch.load(latest_file)
         # print("checkpoint", checkpoint.keys())
 
-        model = AlphaCirNetwork(self.config.hparams, self.config.task_spec)
-        model.load_state_dict(checkpoint["network_state"])
-        self._networks[latest_step] = model
 
-        # ✅ 存储优化器状态
+        self._networks[latest_step] = checkpoint["network_state"]
+        self._optimizers[latest_step] = checkpoint["optimizer_state"]  # 存储优化器状态
         self._optimizer_state_dict = checkpoint["optimizer_state"]
-    # else: 
-    #    print("初始化失败")
+
+    else: 
+       print("No saved model in the remote file, initialization.")
 
 
   def latest_network(self) -> AlphaCirNetwork:
-    if self._networks:
-    #   print("get latest network")
-      # Return the latest network (highest step number).
-      print("stored network exists, start with latest network")
-
-      return self._networks[max(self._networks.keys())]
+    current_steps = list(self._networks.keys())
+    # print("current_steps", current_steps)
+    if current_steps:
+        current_max_step = max(current_steps)
+        paramaters = self._networks[current_max_step]  # 获取最新的网络参数
+        network = AlphaCirNetwork(self.config.hparams, self.config.task_spec)
+        network.load_state_dict(paramaters)
+        return  network # 返回最新的网络
     else:
-      # policy -> uniform, value -> 0, reward -> 0
-      print("None stored network, start with uniform network")
-      return make_uniform_network(self._num_actions)
+        current_max_step = -1
+        return make_uniform_network(self._num_actions)
 
-  def save_network(self, step: int, network: AlphaCirNetwork, optimizer: torch.optim.Optimizer):
-    ## 存储在saved_networks文件中
-    ## 只保存AlphaCirNetwork
-    if isinstance(network, AlphaCirNetwork):
-        # === 及时存储 ===
-        # print("存储")
-        self._networks[step] = copy.deepcopy(network)
-
-        # === 硬盘存储 ===
-        os.makedirs(self.model_dir, exist_ok=True)  # 如果不存在则创建
-        path = os.path.join(self.model_dir, f"network_step_{step}.pt")  # 文件名中包含 step 方便排序
-        
+  def save_networks_to_file(self):
+    net_paras_stored = list(self._networks.keys())
+    for step in net_paras_stored:   
+        path = os.path.join(self.model_dir, f"network_step_{step}.pt")
         save_dict = {
-            "network_state": network.state_dict(),  
-        }
-        if optimizer is not None:
-            save_dict["optimizer_state"] = optimizer.state_dict()  ## 保存优化器状态
+            "network_state": self._networks[step],  
+            "optimizer_state": self._optimizers[step] 
+                        }
         torch.save(save_dict, path)  # 保存权重到指定路径
         print(f"保存神经网络到文件: {path}")  # 提示用户保存成功
-
 
 
 
@@ -1951,9 +1935,9 @@ def softmax_sample(visit_counts: List[Tuple[int, Any]], temperature: float):
 # snapshot, produces a game and makes it available to the training job by
 # writing it to a shared replay buffer.
 def run_selfplay(
-    config: AlphaCirConfig, storage: SharedStorage, replay_buffer: ReplayBuffer, games_Queue = None, net = None
+    config: AlphaCirConfig, storage: SharedStorage, games_Queue, networks_cpu, net = None
 ):
-#   print("run_selfplay start")
+  print(f"{current_process().name} run_selfplay start")
   if test_model:
     for _ in tqdm(range(test_model_run)):
         if net is not None:
@@ -1962,43 +1946,35 @@ def run_selfplay(
             network = storage.latest_network()
         
         game = play_game(config, network)
-        replay_buffer.save_game(game)
-        save_game_to_file(replay_buffer.buffer, filename=f"games.pkl")
-     
-  else:
-    # print("run_selfplay start with multiprocessing")
-    
-    # print("num:", num)
-    
-    # print("标签0")
-    num = len(replay_buffer.buffer)
-    pbar = tqdm(desc=f"[{current_process().name}] Stored Games", unit=" games", initial=len(replay_buffer.buffer))
-
-    while True:
-        # print("in while:")
-
-        buffer_size = len(replay_buffer.buffer)
-        pbar.n = buffer_size
-        pbar.refresh()
-        
-        network = storage.latest_network()
-        # network = AlphaCirNetwork(config.hparams, config.task_spec).to("cpu")
-        # network.load_state_dict(storage.latest_network().state_dict())
-        network.eval()
-        # print("get net:")
-        game_history = play_game(config, network)
-        # print(f"{current_process().name} generated game history:", game_history)
-        recorder_fid.add_scalar("SelfPlay/Fidelity", game_history[-1]["fidelity"], num)
-        # print("标签1")
-        games_Queue.put(game_history)  # 将游戏放入队列供训练使用
-        # print("标签2")
-        ## 存储数据
         # replay_buffer.save_game(game)
         # save_game_to_file(replay_buffer.buffer, filename=f"games.pkl")
+     
+  else:
+
+    num = 0
+    current_step = -1  # 追踪当前已加载的模型 step
+    network = None
+    while True:
+        steps = list(networks_cpu.keys())
+        if steps:
+            max_step = max(steps)
+            if max_step > current_step:
+                # print(f"[SelfPlay] 检测到新模型 step={max_step}，更新网络")
+                current_step = max_step
+                network = AlphaCirNetwork(config.hparams, config.task_spec)
+                network.load_state_dict(networks_cpu[current_step])
+                network = AlphaCirNetwork(config.hparams, config.task_spec).to("cuda")
+                print(f"Stored model exists, started with {max_step}")
+            
+        else:
+            print("None stored network, start with uniform network")
+            network = make_uniform_network(config.task_spec.num_actions)
+
+        network.eval()
+        game_history = play_game(config, network)
+        recorder_fid.add_scalar("SelfPlay/Fidelity", game_history[-1]["fidelity"], num)
         
-        ## tqdm 进度条更新
-        # pbar.update(1) 
-        # print("标签3")
+        games_Queue.put(game_history)  # 将游戏放入队列中，等待game_collector将数据传递添加到replaybuffer
         num += 1
 
 
@@ -2025,7 +2001,7 @@ def play_game(config: AlphaCirConfig, network: AlphaCirNetwork) -> Game:
   Returns:
     The played game.
   """
-  print("play_game start")
+  print(f"[{current_process().name}] play_game start")
   game = Game(config.task_spec)
   game_history = [] 
 
@@ -2351,6 +2327,7 @@ class Trainer:
        else:
             # 从已有网络中取出最大的 step
           self.train_step = max(self.storage._networks.keys())
+
        self.optimizer = torch.optim.SGD(self.network.parameters(), lr=self.config.lr_init, momentum=self.config.momentum)
        if storage._optimizer_state_dict is not None:
             self.optimizer.load_state_dict(self.storage._optimizer_state_dict)
@@ -2361,7 +2338,7 @@ class Trainer:
                             state[k] = v.to(self.device)
 
 
-    def train_network(self):
+    def train_network(self, networks_dict: Dict[int, AlphaCirNetwork.parameters]):
         """Trains the network on data stored in the replay buffer."""
         # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("train start")
@@ -2371,8 +2348,8 @@ class Trainer:
         
         target_network = AlphaCirNetwork(self.config.hparams, self.config.task_spec).to(self.device)
         target_network.load_state_dict(self.network.state_dict())  # 初始化目标网络
-
-        for i in tqdm(range(self.train_step, self.train_step + self.config.max_training_steps), desc="Training Network"):
+        max_step = self.train_step + self.config.max_training_steps
+        for i in tqdm(range(self.train_step + 1, self.train_step + self.config.max_training_steps + 1), desc="Training Network"):
             
             
             for name, param in self.network.named_parameters():
@@ -2447,15 +2424,30 @@ class Trainer:
                 if i > self.train_step:
                     index = max(self.storage._networks.keys())
                     old_net =copy.deepcopy(self.storage._networks[index])
-                    current_network = copy.deepcopy(self.network)                
+                    current_network = self.network.state_dict()             
                     assert not networks_equal(old_net, current_network), "旧的网络和当前网络相同"
-                self.storage.save_network(i, self.network, self.optimizer)
+                self.storage._networks[i] = copy.deepcopy(self.network.state_dict())
+                self.storage._optimizers[i] = copy.deepcopy(self.optimizer.state_dict())
+                self.storage._optimizer_state_dict = self.optimizer.state_dict()  
+                net_cpu = copy.deepcopy(self.network).to("cpu")
+                networks_dict[i] = net_cpu.state_dict()  # 将网络参数保存到字典中   
+
+                # networks_dict[i] = copy.deepcopy(self.network.state_dict()) 
+                # self.storage.save_network(i, self.network, self.optimizer)
+
             time.sleep(1)          
 
             if i % self.config.target_network_interval == 0:
                 target_network.load_state_dict(self.network.state_dict())
         
-        self.storage.save_network(self.config.max_training_steps, self.network, self.optimizer)
+        # self.storage.save_network(self.config.max_training_steps, self.network, self.optimizer)
+        self.storage._networks[max_step] = copy.deepcopy(self.network.state_dict())
+        self.storage._optimizers[max_step] = copy.deepcopy(self.optimizer.state_dict())
+        self.storage._optimizer_state_dict = self.optimizer.state_dict()   
+        net_cpu = copy.deepcopy(self.network).to("cpu")
+        networks_dict[max_step] = net_cpu.state_dict()  # 将网络参数保存到字典中
+        # networks_dict[self.config.max_training_steps] = copy.deepcopy(self.network.state_dict()) 
+
         return losses
 
     def compute_loss(self, network, target_network, batch, device, i):
@@ -2690,23 +2682,27 @@ def AlphaCir_single(config: AlphaCirConfig):
     return storage.latest_network(), losses
 
 def game_collector(buffer, games_queue):
-    buffer_temp = []
+    pbar = tqdm(total=0, desc="Buffer size shown by collector", ncols=100, bar_format="{desc}: {n}")
+    pbar.n = len(buffer.buffer)
+    pbar.refresh()
     while True:
         try:
-            game_history = games_queue.get(timeout = 1000)
-           # for name, value in game.__dict__.items():
-            #     if isinstance(value, torch.Tensor) and value.is_cuda:
-            #         print(f"⚠️ GPU Tensor 未释放：{name}")
-            #     else:
-            #         print(f"✅ {name} 正常")
-            buffer_temp.append(game_history)
+            # print("buffer in collector", buffer.buffer[-1])
+            game_history = games_queue.get(timeout = 600)
+            if game_history is None:
+                print("Queue is empty for long time, exiting.")
+                break
+            buffer.append_games(game_history)
+            ## 更新进度条描述
+            pbar.n = len(buffer.buffer)
+            pbar.refresh()
         except (queue.Empty, mp_Empty):
-            print("[Collector] No data for 1000 seconds, exit.")
+            print("[Collector] No data for 600 seconds, exit.")
             break
-        if len(buffer_temp) >= 2:
-            buffer.save_buffer_to_file(buffer_temp, path="temp_games/games.pkl")
-            buffer_temp = []  # 清空临时缓冲区
-        # print("Game saved to buffer. Current size:", len(buffer.buffer))
+        # if len(buffer_temp) >= 2:
+        #     buffer.save_buffer_to_file(buffer_temp, path="temp_games/games.pkl")
+        #     buffer_temp = []  # 清空临时缓冲区
+        # # print("Game saved to buffer. Current size:", len(buffer.buffer))
 
 ## multi actors version
 def AlphaCir_multi(config: AlphaCirConfig):     
@@ -2714,22 +2710,38 @@ def AlphaCir_multi(config: AlphaCirConfig):
     storage = SharedStorage(config.task_spec.num_actions, config)     
     replay_buffer = ReplayBuffer(config)   
     print("buffer size:", len(replay_buffer.buffer))  
+    ## Networks_cpu initialization
+    Networks_cpu = tmp.Manager().dict()  ## 共享字典，从训练中收集网络， 给子进程self-play使用
+    model_dir = "saved_models"
+    os.makedirs(model_dir, exist_ok=True)
+    model_files = glob.glob(os.path.join(model_dir, "network_step_*.pt"))
+    if model_files:
+        extract_step = lambda f: int(re.findall(r"network_step_(\d+).pt", f)[0])
+        latest_file = max(model_files, key=extract_step)
+        latest_step = extract_step(latest_file)
+        checkpoint = torch.load(latest_file)
+        Network = AlphaCirNetwork(config.hparams, config.task_spec).to("cpu")
+        Network.load_state_dict(checkpoint["network_state"])
+        Networks_cpu[latest_step] = Network.state_dict()  # 将网络参数保存到共享字典中
+
+    ## load net 
     trainer = Trainer(config, storage, replay_buffer) 
      # 启动多个 self-play actor 进程     
     num_actors = config.num_actors if hasattr(config, 'num_actors') else 4  # 默认 4 个 actor  
     # print("num_actors", num_actors)
     games_Queue = Queue()   
     collector_thread = threading.Thread(target=game_collector, args=(replay_buffer, games_Queue))
-    collector_thread.daemon = de_daemon  # 主程序结束它也结束
+    collector_thread.daemon = False  
     collector_thread.start()
 
     # print("⚠️ here")
+
     selfplay_processes = []     
     for i in range(num_actors):  
         p = Process(             
             target=run_selfplay,  
             name=f"Actor-{i+1}",           
-            args=(config, storage, replay_buffer, games_Queue),             
+            args=(config, storage, games_Queue, Networks_cpu),  # 传递共享字典          
             daemon = de_daemon,   ## trainer没有问题了 改回True
                 )         
         p.start()  
@@ -2749,10 +2761,21 @@ def AlphaCir_multi(config: AlphaCirConfig):
     print("ReplayBuffer已填满，开始训练！") 
 
 
+    loss = trainer.train_network(Networks_cpu)
+    ## save all games to file
 
+    for p in selfplay_processes:
+        p.terminate()
+        p.join()
+        print(f"[{p.name}] 终止")
 
-    loss = trainer.train_network()
-         
+    collector_thread.join()
+    replay_buffer.save_buffer_to_file()
+    print("游戏记录 完成")
+    storage.save_networks_to_file()
+    print("神经网参数记录 完成")
+
+    
     # 你可以根据需要监控进度或在外部控制退出 
     recorder_fid.close()
     recorder_loss.close()
